@@ -220,19 +220,16 @@ async def fetch_market_data(exchange, symbol):
         ticker = await exchange.fetch_ticker(symbol)
         bid = ticker['bid'] if 'bid' in ticker else None
         ask = ticker['ask'] if 'ask' in ticker else None
-        # Fetch order book for volume only
-        order_book = await exchange.fetch_order_book(symbol, limit=20)
-        bid_volume = order_book['bids'][0][1] if order_book['bids'] else 0
-        ask_volume = order_book['asks'][0][1] if order_book['asks'] else 0
-        return bid, ask, bid_volume, ask_volume
+        volume = ticker.get('quoteVolume', 0)  # 24h quote volume in USDT
+        return bid, ask, volume
     except ccxt.RateLimitExceeded as e:
         logger.warning(f"Rate limit exceeded on {exchange.id}. Backing off...")
         logger.error(f"Rate limit error details: {e}\n{traceback.format_exc()}")
         await asyncio.sleep(2 ** int(math.log2(random.randint(1, 5))))
-        return None, None, 0, 0
+        return None, None, 0
     except Exception as e:
         logger.error(f"Error fetching market data for {symbol} on {exchange.id}: {e}\n{traceback.format_exc()}")
-        return None, None, 0, 0
+        return None, None, 0
 
 async def calculate_volatility(exchange, symbol, periods=5, interval='1m'):
     try:
@@ -292,22 +289,22 @@ async def calculate_triangular_arbitrage(exchange, pair1, pair2, pair3, amount, 
     try:
         prices = []
         for _ in range(avg_trades):
-            bid1, ask1, bid_vol1, ask_vol1 = await fetch_market_data(exchange, pair1)
-            bid2, ask2, bid_vol2, ask_vol2 = await fetch_market_data(exchange, pair2)
-            bid3, ask3, bid_vol3, ask_vol3 = await fetch_market_data(exchange, pair3)
+            bid1, ask1, vol1 = await fetch_market_data(exchange, pair1)
+            bid2, ask2, vol2 = await fetch_market_data(exchange, pair2)
+            bid3, ask3, vol3 = await fetch_market_data(exchange, pair3)
             
             if not all([bid1, ask1, bid2, ask2, bid3, ask3]):
                 logger.error(f"Missing price data for {pair1}, {pair2}, {pair3} on {exchange.id}")
                 return None, 0.0
 
-            min_volume = min(bid_vol1, ask_vol1, bid_vol2, ask_vol2, bid_vol3, ask_vol3)
-            if min_volume < amount:
-                logger.info(f"Insufficient liquidity for {pair1}, {pair2}, {pair3} on {exchange.id}. "
-                           f"Trade amount: {amount:.2f}, "
-                           f"Volumes: {pair1} (bid: {bid_vol1:.2f} @ {bid1:.6f}, ask: {ask_vol1:.2f} @ {ask1:.6f}), "
-                           f"{pair2} (bid: {bid_vol2:.2f} @ {bid2:.6f}, ask: {ask_vol2:.2f} @ {ask2:.6f}), "
-                           f"{pair3} (bid: {bid_vol3:.2f} @ {bid3:.6f}, ask: {ask_vol3:.2f} @ {ask3:.6f})")
-                return None, 0.0
+            # Optional: Warn about low 24h volume (e.g., < 1000 USDT)
+            min_volume = min(vol1, vol2, vol3)
+            if min_volume < 1000:
+                logger.warning(f"Low 24h volume for {pair1}, {pair2}, {pair3} on {exchange.id}. "
+                              f"Trade amount: {amount:.2f}, "
+                              f"Volumes: {pair1} (24h: {vol1:.2f} USDT @ bid {bid1:.6f}, ask {ask1:.6f}), "
+                              f"{pair2} (24h: {vol2:.2f} USDT @ bid {bid2:.6f}, ask {ask2:.6f}), "
+                              f"{pair3} (24h: {vol3:.2f} USDT @ bid {bid3:.6f}, ask {ask3:.6f})")
 
             volatility = max(
                 await calculate_volatility(exchange, pair1),
