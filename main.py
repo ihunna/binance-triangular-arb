@@ -363,6 +363,59 @@ def simulate_trade(exchange, pair1, pair2, pair3, trade_details):
         logger.error(f"Error simulating trade on {exchange.id}: {e}\n{traceback.format_exc()}")
         return False
 
+async def log_trade_to_csv(exchange, pair1, pair2, pair3, trade_details):
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    async with history_lock:  # Use async with
+        with open(CONFIG['trade_log_file'], 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                timestamp,
+                exchange.id,
+                pair1,
+                pair2,
+                pair3,
+                trade_details['initial_amount'],
+                trade_details['final_amount'],
+                trade_details['avg_profit'],
+                trade_details['avg_profit_percentage'],
+                mock_balance['USDT']
+            ])
+
+async def simulate_trade(exchange, pair1, pair2, pair3, trade_details):
+    if not trade_details:
+        return False
+    try:
+        initial_amount = trade_details['initial_amount']
+        final_amount = trade_details['final_amount']
+        profit = trade_details['avg_profit']
+        profit_percentage = trade_details['avg_profit_percentage']
+        dynamic_threshold = CONFIG['min_profit_threshold']
+        async with history_lock:  # Use async with
+            if recent_profits:
+                dynamic_threshold = max(CONFIG['min_profit_threshold'], np.mean(recent_profits) * 0.8)
+        if profit_percentage >= dynamic_threshold:
+            async with balance_lock:  # Use async with
+                mock_balance['USDT'] = mock_balance['USDT'] - initial_amount + final_amount
+            async with history_lock:  # Use async with
+                recent_profits.append(profit_percentage)
+                trade_history.append(trade_details)
+                if len(recent_profits) > 10:
+                    recent_profits.pop(0)
+            print_trade_update(exchange, pair1, pair2, pair3, trade_details)
+            await log_trade_to_csv(exchange, pair1, pair2, pair3, trade_details)  # Await async function
+            async with balance_lock:  # Use async with
+                if mock_balance['USDT'] < initial_balance * CONFIG['stop_loss_threshold']:
+                    logger.error(f"Stop-loss triggered: Balance below threshold\n{traceback.format_exc()}")
+                    print_summary()
+                    raise Exception("Stop-loss triggered")
+            return True
+        else:
+            logger.info(f"No profitable trade. Profit {profit_percentage:.2f}% below threshold {dynamic_threshold}%")
+            return False
+    except Exception as e:
+        logger.error(f"Error simulating trade on {exchange.id}: {e}\n{traceback.format_exc()}")
+        return False
+
 async def run_exchange(exchange_name, exchange):
     console.print(f"[yellow]Loading markets for {exchange_name}[/yellow]")
     logger.info(f"Loading markets for {exchange_name}")
@@ -371,7 +424,7 @@ async def run_exchange(exchange_name, exchange):
         console.print(f"[cyan]Found {len(triplets)} valid triplets on {exchange_name}: {triplets}[/cyan]")
         logger.info(f"Found {len(triplets)} valid triplets on {exchange_name}")
         while True:
-            with balance_lock:
+            async with balance_lock:  # Use async with
                 if mock_balance['USDT'] < initial_balance * CONFIG['stop_loss_threshold']:
                     console.print(f"[bold red]Trading halted on {exchange_name}: Balance below stop-loss threshold[/bold red]")
                     logger.error(f"Trading halted on {exchange_name}: Balance below stop-loss threshold")
@@ -379,16 +432,14 @@ async def run_exchange(exchange_name, exchange):
                     break
             for pair1, pair2, pair3 in triplets:
                 logger.info(f"Checking arbitrage on {exchange_name} for {pair1}, {pair2}, {pair3}")
-                with balance_lock:
+                async with balance_lock:  # Use async with
                     max_trade_amount = mock_balance['USDT'] * CONFIG['max_exposure']
                     trade_amount = min(max_trade_amount, CONFIG['initial_balance'] * 0.1)
                 trade_details, final_amount = await asyncio.get_event_loop().run_in_executor(
                     None, calculate_triangular_arbitrage, exchange, pair1, pair2, pair3, trade_amount, CONFIG['trace_back']
                 )
                 if trade_details and final_amount > trade_amount:
-                    await asyncio.get_event_loop().run_in_executor(
-                        None, simulate_trade, exchange, pair1, pair2, pair3, trade_details
-                    )
+                    await simulate_trade(exchange, pair1, pair2, pair3, trade_details)
                 else:
                     logger.info(f"No arbitrage opportunity on {exchange_name} for {pair1}, {pair2}, {pair3}")
                 await asyncio.sleep(CONFIG['sleep_interval'])
