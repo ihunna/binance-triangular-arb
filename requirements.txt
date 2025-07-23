@@ -1,4 +1,5 @@
-ccxt==4.4.95
-numpy==2.3.1
-pandas==2.3.1
-python-dotenv==1.1.1
+ccxt
+numpy
+pandas
+python-dotenv
+rich

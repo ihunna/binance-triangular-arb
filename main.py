@@ -218,7 +218,7 @@ def print_summary():
     table.add_row("Recent Profits", f"{[f'{p:.2f}%' for p in recent_profits]}")
     console.print(table)
 
-def fetch_order_book(exchange, symbol, limit=10):
+def fetch_order_book(exchange, symbol, limit=20):
     try:
         order_book = exchange.fetch_order_book(symbol, limit=limit)
         bid = order_book['bids'][0][0] if order_book['bids'] else None
