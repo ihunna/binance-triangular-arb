@@ -17,12 +17,22 @@ env_path = os.path.join(parent_folder, '.env')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+if not os.path.exists(env_path):
+    logger.error(f".env file not found at {env_path}")
+    raise FileNotFoundError(f".env file not found at {env_path}")
+
+load_dotenv(env_path)
+
+BINANCE_API_KEY, BINANCE_SECRET = os.getenv('BINANCE_API_KEY'),os.getenv('BINANCE_SECRET')
+if not BINANCE_API_KEY or not BINANCE_SECRET:
+    raise Exception('Binance creds are missing')
+
 # Configuration
 CONFIG = {
     'exchanges': {
         'binance': {
-            'apiKey': os.getenv('BINANCE_API_KEY'),  # Replace with your Binance API key
-            'secret': os.getenv('YBINANCE_SECRET'),   # Replace with your Binance secret
+            'apiKey': BINANCE_API_KEY,  # Replace with your Binance API key
+            'secret': BINANCE_SECRET,   # Replace with your Binance secret
             'enableRateLimit': True
         },
         'coinbase': {
