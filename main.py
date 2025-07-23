@@ -1,4 +1,4 @@
-import ccxt
+import ccxt.async_support as ccxt
 import pandas as pd
 import time
 import logging
@@ -6,7 +6,6 @@ import itertools
 import numpy as np
 import os
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 from datetime import datetime
 import random
@@ -83,7 +82,9 @@ CONFIG = {
             'apiKey': API_KEYS['kucoin']['apiKey'],
             'secret': API_KEYS['kucoin']['secret'],
             'passphrase': API_KEYS['kucoin']['passphrase'],
-            'enableRateLimit': True
+            'enableRateLimit': True,
+            'retries': 3,
+            'retryDelay': 1000
         },
         'binance': {
             'active': False,
@@ -92,8 +93,8 @@ CONFIG = {
             'enableRateLimit': True
         }
     },
-    'coins': ['BTC', 'ETH', 'USDT', 'LTC', 'XRP'],
-    'trace_back': 5,
+    'coin_depth': 20,  # Number of coins to fetch
+    'avg_trades': 5,  # Number of trades to average for arbitrage
     'fee_rate': {'bybit': 0.001, 'kucoin': 0.001, 'binance': 0.001},
     'min_profit_threshold': 0.01,
     'max_exposure': 0.1,
@@ -147,11 +148,7 @@ if not exchanges:
 
 # Mock funds
 mock_balance = {
-    'USDT': CONFIG['initial_balance'],
-    'BTC': 0.0,
-    'ETH': 0.0,
-    'LTC': 0.0,
-    'XRP': 0.0
+    'USDT': CONFIG['initial_balance']
 }
 initial_balance = CONFIG['initial_balance']
 trade_history = []
@@ -162,9 +159,9 @@ with open(CONFIG['trade_log_file'], 'w', newline='') as f:
     writer = csv.writer(f)
     writer.writerow(['Timestamp', 'Exchange', 'Pair1', 'Pair2', 'Pair3', 'Initial_Amount', 'Final_Amount', 'Profit', 'Profit_Percentage', 'Balance_USDT'])
 
-def log_trade_to_csv(exchange, pair1, pair2, pair3, trade_details):
+async def log_trade_to_csv(exchange, pair1, pair2, pair3, trade_details):
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    with history_lock:
+    async with history_lock:
         with open(CONFIG['trade_log_file'], 'a', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([
@@ -198,8 +195,8 @@ def print_trade_update(exchange, pair1, pair2, pair3, trade_details):
     table.add_row("Current Balance", f"{mock_balance['USDT']:.2f} USDT")
     console.print(table)
 
-def print_summary():
-    with history_lock:
+async def print_summary():
+    async with history_lock:
         total_trades = len(trade_history)
         wins = len([t for t in trade_history if t['avg_profit'] > 0])
         losses = len([t for t in trade_history if t['avg_profit'] <= 0])
@@ -218,9 +215,9 @@ def print_summary():
     table.add_row("Recent Profits", f"{[f'{p:.2f}%' for p in recent_profits]}")
     console.print(table)
 
-def fetch_order_book(exchange, symbol, limit=20):
+async def fetch_order_book(exchange, symbol, limit=20):
     try:
-        order_book = exchange.fetch_order_book(symbol, limit=limit)
+        order_book = await exchange.fetch_order_book(symbol, limit=limit)
         bid = order_book['bids'][0][0] if order_book['bids'] else None
         ask = order_book['asks'][0][0] if order_book['asks'] else None
         bid_volume = order_book['bids'][0][1] if order_book['bids'] else 0
@@ -229,15 +226,15 @@ def fetch_order_book(exchange, symbol, limit=20):
     except ccxt.RateLimitExceeded as e:
         logger.warning(f"Rate limit exceeded on {exchange.id}. Backing off...")
         logger.error(f"Rate limit error details: {e}\n{traceback.format_exc()}")
-        time.sleep(2 ** int(math.log2(random.randint(1, 5))))
+        await asyncio.sleep(2 ** int(math.log2(random.randint(1, 5))))
         return None, None, 0, 0
     except Exception as e:
         logger.error(f"Error fetching order book for {symbol} on {exchange.id}: {e}\n{traceback.format_exc()}")
         return None, None, 0, 0
 
-def calculate_volatility(exchange, symbol, periods=5, interval='1m'):
+async def calculate_volatility(exchange, symbol, periods=5, interval='1m'):
     try:
-        ohlcv = exchange.fetch_ohlcv(symbol, interval, limit=periods)
+        ohlcv = await exchange.fetch_ohlcv(symbol, interval, limit=periods)
         prices = [candle[4] for candle in ohlcv]
         returns = [(prices[i] - prices[i-1]) / prices[i-1] for i in range(1, len(prices))]
         volatility = np.std(returns) if returns else 0
@@ -246,9 +243,33 @@ def calculate_volatility(exchange, symbol, periods=5, interval='1m'):
         logger.error(f"Error calculating volatility for {symbol} on {exchange.id}: {e}\n{traceback.format_exc()}")
         return float('inf')
 
-def generate_triplets(coins, exchange):
+async def fetch_top_coins(exchange, coin_depth):
     try:
-        markets = exchange.load_markets()
+        markets = await exchange.load_markets()
+        # Fetch tickers to sort by volume
+        tickers = await exchange.fetch_tickers()
+        # Filter coins with USDT pairs and sort by volume
+        usdt_pairs = [symbol for symbol in tickers if symbol.endswith('/USDT') and markets[symbol].get('active', True)]
+        sorted_pairs = sorted(
+            usdt_pairs,
+            key=lambda x: tickers[x].get('quoteVolume', 0),
+            reverse=True
+        )
+        # Extract base coins (e.g., 'BTC' from 'BTC/USDT')
+        coins = [pair.split('/')[0] for pair in sorted_pairs[:coin_depth]]
+        logger.info(f"Fetched {len(coins)} coins on {exchange.id}: {coins}")
+        # Update mock_balance with new coins
+        for coin in coins:
+            if coin not in mock_balance:
+                mock_balance[coin] = 0.0
+        return coins
+    except Exception as e:
+        logger.error(f"Error fetching top coins on {exchange.id}: {e}\n{traceback.format_exc()}")
+        return []
+
+async def generate_triplets(coins, exchange):
+    try:
+        markets = await exchange.load_markets()
         valid_pairs = set(markets.keys())
         triplets = []
         for base, quote, third in itertools.permutations(coins, 3):
@@ -263,25 +284,31 @@ def generate_triplets(coins, exchange):
         logger.error(f"Error generating triplets on {exchange.id}: {e}\n{traceback.format_exc()}")
         return []
 
-def calculate_triangular_arbitrage(exchange, pair1, pair2, pair3, amount, trace_back):
+async def calculate_triangular_arbitrage(exchange, pair1, pair2, pair3, amount, avg_trades):
     try:
         prices = []
-        for _ in range(trace_back):
-            bid1, ask1, bid_vol1, ask_vol1 = fetch_order_book(exchange, pair1)
-            bid2, ask2, bid_vol2, ask_vol2 = fetch_order_book(exchange, pair2)
-            bid3, ask3, bid_vol3, ask_vol3 = fetch_order_book(exchange, pair3)
+        for _ in range(avg_trades):
+            bid1, ask1, bid_vol1, ask_vol1 = await fetch_order_book(exchange, pair1)
+            bid2, ask2, bid_vol2, ask_vol2 = await fetch_order_book(exchange, pair2)
+            bid3, ask3, bid_vol3, ask_vol3 = await fetch_order_book(exchange, pair3)
             
             if not all([bid1, ask1, bid2, ask2, bid3, ask3]):
+                logger.error(f"Missing price data for {pair1}, {pair2}, {pair3} on {exchange.id}")
                 return None, 0.0
 
-            if min(bid_vol1, ask_vol1, bid_vol2, ask_vol2, bid_vol3, ask_vol3) < amount:
-                logger.info(f"Insufficient liquidity for {pair1}, {pair2}, {pair3} on {exchange.id}")
+            min_volume = min(bid_vol1, ask_vol1, bid_vol2, ask_vol2, bid_vol3, ask_vol3)
+            if min_volume < amount:
+                logger.info(f"Insufficient liquidity for {pair1}, {pair2}, {pair3} on {exchange.id}. "
+                           f"Trade amount: {amount:.2f}, "
+                           f"Volumes: {pair1} (bid: {bid_vol1:.2f}, ask: {ask_vol1:.2f}), "
+                           f"{pair2} (bid: {bid_vol2:.2f}, ask: {ask_vol2:.2f}), "
+                           f"{pair3} (bid: {bid_vol3:.2f}, ask: {ask_vol3:.2f})")
                 return None, 0.0
 
             volatility = max(
-                calculate_volatility(exchange, pair1),
-                calculate_volatility(exchange, pair2),
-                calculate_volatility(exchange, pair3)
+                await calculate_volatility(exchange, pair1),
+                await calculate_volatility(exchange, pair2),
+                await calculate_volatility(exchange, pair3)
             )
             if volatility > CONFIG['max_volatility']:
                 logger.info(f"Volatility too high ({volatility:.4f}) for {pair1}, {pair2}, {pair3}")
@@ -313,7 +340,7 @@ def calculate_triangular_arbitrage(exchange, pair1, pair2, pair3, amount, trace_
                 'profit_percentage': profit_percentage
             })
 
-            time.sleep(0.1)
+            await asyncio.sleep(0.1)
 
         avg_profit = np.mean([p['profit'] for p in prices])
         avg_profit_percentage = np.mean([p['profit_percentage'] for p in prices])
@@ -328,59 +355,6 @@ def calculate_triangular_arbitrage(exchange, pair1, pair2, pair3, amount, trace_
         logger.error(f"Error calculating arbitrage on {exchange.id}: {e}\n{traceback.format_exc()}")
         return None, 0.0
 
-def simulate_trade(exchange, pair1, pair2, pair3, trade_details):
-    if not trade_details:
-        return False
-    try:
-        initial_amount = trade_details['initial_amount']
-        final_amount = trade_details['final_amount']
-        profit = trade_details['avg_profit']
-        profit_percentage = trade_details['avg_profit_percentage']
-        dynamic_threshold = CONFIG['min_profit_threshold']
-        with history_lock:
-            if recent_profits:
-                dynamic_threshold = max(CONFIG['min_profit_threshold'], np.mean(recent_profits) * 0.8)
-        if profit_percentage >= dynamic_threshold:
-            with balance_lock:
-                mock_balance['USDT'] = mock_balance['USDT'] - initial_amount + final_amount
-            with history_lock:
-                recent_profits.append(profit_percentage)
-                trade_history.append(trade_details)
-                if len(recent_profits) > 10:
-                    recent_profits.pop(0)
-            print_trade_update(exchange, pair1, pair2, pair3, trade_details)
-            log_trade_to_csv(exchange, pair1, pair2, pair3, trade_details)
-            with balance_lock:
-                if mock_balance['USDT'] < initial_balance * CONFIG['stop_loss_threshold']:
-                    logger.error(f"Stop-loss triggered: Balance below threshold\n{traceback.format_exc()}")
-                    print_summary()
-                    raise Exception("Stop-loss triggered")
-            return True
-        else:
-            logger.info(f"No profitable trade. Profit {profit_percentage:.2f}% below threshold {dynamic_threshold}%")
-            return False
-    except Exception as e:
-        logger.error(f"Error simulating trade on {exchange.id}: {e}\n{traceback.format_exc()}")
-        return False
-
-async def log_trade_to_csv(exchange, pair1, pair2, pair3, trade_details):
-    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    async with history_lock:  # Use async with
-        with open(CONFIG['trade_log_file'], 'a', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                timestamp,
-                exchange.id,
-                pair1,
-                pair2,
-                pair3,
-                trade_details['initial_amount'],
-                trade_details['final_amount'],
-                trade_details['avg_profit'],
-                trade_details['avg_profit_percentage'],
-                mock_balance['USDT']
-            ])
-
 async def simulate_trade(exchange, pair1, pair2, pair3, trade_details):
     if not trade_details:
         return False
@@ -390,20 +364,20 @@ async def simulate_trade(exchange, pair1, pair2, pair3, trade_details):
         profit = trade_details['avg_profit']
         profit_percentage = trade_details['avg_profit_percentage']
         dynamic_threshold = CONFIG['min_profit_threshold']
-        async with history_lock:  # Use async with
+        async with history_lock:
             if recent_profits:
                 dynamic_threshold = max(CONFIG['min_profit_threshold'], np.mean(recent_profits) * 0.8)
         if profit_percentage >= dynamic_threshold:
-            async with balance_lock:  # Use async with
+            async with balance_lock:
                 mock_balance['USDT'] = mock_balance['USDT'] - initial_amount + final_amount
-            async with history_lock:  # Use async with
+            async with history_lock:
                 recent_profits.append(profit_percentage)
                 trade_history.append(trade_details)
                 if len(recent_profits) > 10:
                     recent_profits.pop(0)
             print_trade_update(exchange, pair1, pair2, pair3, trade_details)
-            await log_trade_to_csv(exchange, pair1, pair2, pair3, trade_details)  # Await async function
-            async with balance_lock:  # Use async with
+            await log_trade_to_csv(exchange, pair1, pair2, pair3, trade_details)
+            async with balance_lock:
                 if mock_balance['USDT'] < initial_balance * CONFIG['stop_loss_threshold']:
                     logger.error(f"Stop-loss triggered: Balance below threshold\n{traceback.format_exc()}")
                     print_summary()
@@ -420,11 +394,15 @@ async def run_exchange(exchange_name, exchange):
     console.print(f"[yellow]Loading markets for {exchange_name}[/yellow]")
     logger.info(f"Loading markets for {exchange_name}")
     try:
-        triplets = generate_triplets(CONFIG['coins'], exchange)
+        coins = await fetch_top_coins(exchange, CONFIG['coin_depth'])
+        if len(coins) < 3:
+            logger.error(f"Not enough coins ({len(coins)}) to form triplets on {exchange_name}")
+            return
+        triplets = await generate_triplets(coins, exchange)
         console.print(f"[cyan]Found {len(triplets)} valid triplets on {exchange_name}: {triplets}[/cyan]")
         logger.info(f"Found {len(triplets)} valid triplets on {exchange_name}")
         while True:
-            async with balance_lock:  # Use async with
+            async with balance_lock:
                 if mock_balance['USDT'] < initial_balance * CONFIG['stop_loss_threshold']:
                     console.print(f"[bold red]Trading halted on {exchange_name}: Balance below stop-loss threshold[/bold red]")
                     logger.error(f"Trading halted on {exchange_name}: Balance below stop-loss threshold")
@@ -432,11 +410,11 @@ async def run_exchange(exchange_name, exchange):
                     break
             for pair1, pair2, pair3 in triplets:
                 logger.info(f"Checking arbitrage on {exchange_name} for {pair1}, {pair2}, {pair3}")
-                async with balance_lock:  # Use async with
+                async with balance_lock:
                     max_trade_amount = mock_balance['USDT'] * CONFIG['max_exposure']
                     trade_amount = min(max_trade_amount, CONFIG['initial_balance'] * 0.1)
-                trade_details, final_amount = await asyncio.get_event_loop().run_in_executor(
-                    None, calculate_triangular_arbitrage, exchange, pair1, pair2, pair3, trade_amount, CONFIG['trace_back']
+                trade_details, final_amount = await calculate_triangular_arbitrage(
+                    exchange, pair1, pair2, pair3, trade_amount, CONFIG['avg_trades']
                 )
                 if trade_details and final_amount > trade_amount:
                     await simulate_trade(exchange, pair1, pair2, pair3, trade_details)
@@ -447,6 +425,8 @@ async def run_exchange(exchange_name, exchange):
         console.print(f"[bold red]Fatal error on {exchange_name}: {e}[/bold red]")
         logger.error(f"Fatal error on {exchange_name}: {e}\n{traceback.format_exc()}")
         print_summary()
+    finally:
+        await exchange.close()
 
 async def main():
     console.print(f"[bold green]Bot started with active exchanges: {[name for name in exchanges]}[/bold green]")
@@ -461,6 +441,8 @@ async def main():
     finally:
         console.print("[bold green]Bot stopped[/bold green]")
         logger.info("Bot stopped")
+        for exchange in exchanges.values():
+            await exchange.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
