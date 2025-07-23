@@ -93,7 +93,7 @@ CONFIG = {
             'enableRateLimit': True
         }
     },
-    'coin_depth': 20,  # Number of coins to fetch
+    'coin_count': 20,  # Number of coins to fetch
     'avg_trades': 5,  # Number of trades to average for arbitrage
     'fee_rate': {'bybit': 0.001, 'kucoin': 0.001, 'binance': 0.001},
     'min_profit_threshold': 0.01,
@@ -215,11 +215,13 @@ async def print_summary():
     table.add_row("Recent Profits", f"{[f'{p:.2f}%' for p in recent_profits]}")
     console.print(table)
 
-async def fetch_order_book(exchange, symbol, limit=20):
+async def fetch_market_data(exchange, symbol):
     try:
-        order_book = await exchange.fetch_order_book(symbol, limit=limit)
-        bid = order_book['bids'][0][0] if order_book['bids'] else None
-        ask = order_book['asks'][0][0] if order_book['asks'] else None
+        ticker = await exchange.fetch_ticker(symbol)
+        bid = ticker['bid'] if 'bid' in ticker else None
+        ask = ticker['ask'] if 'ask' in ticker else None
+        # Fetch order book for volume only
+        order_book = await exchange.fetch_order_book(symbol, limit=20)
         bid_volume = order_book['bids'][0][1] if order_book['bids'] else 0
         ask_volume = order_book['asks'][0][1] if order_book['asks'] else 0
         return bid, ask, bid_volume, ask_volume
@@ -229,7 +231,7 @@ async def fetch_order_book(exchange, symbol, limit=20):
         await asyncio.sleep(2 ** int(math.log2(random.randint(1, 5))))
         return None, None, 0, 0
     except Exception as e:
-        logger.error(f"Error fetching order book for {symbol} on {exchange.id}: {e}\n{traceback.format_exc()}")
+        logger.error(f"Error fetching market data for {symbol} on {exchange.id}: {e}\n{traceback.format_exc()}")
         return None, None, 0, 0
 
 async def calculate_volatility(exchange, symbol, periods=5, interval='1m'):
@@ -243,10 +245,9 @@ async def calculate_volatility(exchange, symbol, periods=5, interval='1m'):
         logger.error(f"Error calculating volatility for {symbol} on {exchange.id}: {e}\n{traceback.format_exc()}")
         return float('inf')
 
-async def fetch_top_coins(exchange, coin_depth):
+async def fetch_top_coins(exchange, coin_count):
     try:
         markets = await exchange.load_markets()
-        # Fetch tickers to sort by volume
         tickers = await exchange.fetch_tickers()
         # Filter coins with USDT pairs and sort by volume
         usdt_pairs = [symbol for symbol in tickers if symbol.endswith('/USDT') and markets[symbol].get('active', True)]
@@ -256,7 +257,10 @@ async def fetch_top_coins(exchange, coin_depth):
             reverse=True
         )
         # Extract base coins (e.g., 'BTC' from 'BTC/USDT')
-        coins = [pair.split('/')[0] for pair in sorted_pairs[:coin_depth]]
+        coins = [pair.split('/')[0] for pair in sorted_pairs[:coin_count]]
+        # Ensure USDT is included for arbitrage
+        if 'USDT' not in coins:
+            coins.append('USDT')
         logger.info(f"Fetched {len(coins)} coins on {exchange.id}: {coins}")
         # Update mock_balance with new coins
         for coin in coins:
@@ -265,7 +269,7 @@ async def fetch_top_coins(exchange, coin_depth):
         return coins
     except Exception as e:
         logger.error(f"Error fetching top coins on {exchange.id}: {e}\n{traceback.format_exc()}")
-        return []
+        return ['USDT']  # Fallback to USDT only
 
 async def generate_triplets(coins, exchange):
     try:
@@ -288,9 +292,9 @@ async def calculate_triangular_arbitrage(exchange, pair1, pair2, pair3, amount, 
     try:
         prices = []
         for _ in range(avg_trades):
-            bid1, ask1, bid_vol1, ask_vol1 = await fetch_order_book(exchange, pair1)
-            bid2, ask2, bid_vol2, ask_vol2 = await fetch_order_book(exchange, pair2)
-            bid3, ask3, bid_vol3, ask_vol3 = await fetch_order_book(exchange, pair3)
+            bid1, ask1, bid_vol1, ask_vol1 = await fetch_market_data(exchange, pair1)
+            bid2, ask2, bid_vol2, ask_vol2 = await fetch_market_data(exchange, pair2)
+            bid3, ask3, bid_vol3, ask_vol3 = await fetch_market_data(exchange, pair3)
             
             if not all([bid1, ask1, bid2, ask2, bid3, ask3]):
                 logger.error(f"Missing price data for {pair1}, {pair2}, {pair3} on {exchange.id}")
@@ -300,9 +304,9 @@ async def calculate_triangular_arbitrage(exchange, pair1, pair2, pair3, amount, 
             if min_volume < amount:
                 logger.info(f"Insufficient liquidity for {pair1}, {pair2}, {pair3} on {exchange.id}. "
                            f"Trade amount: {amount:.2f}, "
-                           f"Volumes: {pair1} (bid: {bid_vol1:.2f}, ask: {ask_vol1:.2f}), "
-                           f"{pair2} (bid: {bid_vol2:.2f}, ask: {ask_vol2:.2f}), "
-                           f"{pair3} (bid: {bid_vol3:.2f}, ask: {ask_vol3:.2f})")
+                           f"Volumes: {pair1} (bid: {bid_vol1:.2f} @ {bid1:.6f}, ask: {ask_vol1:.2f} @ {ask1:.6f}), "
+                           f"{pair2} (bid: {bid_vol2:.2f} @ {bid2:.6f}, ask: {ask_vol2:.2f} @ {ask2:.6f}), "
+                           f"{pair3} (bid: {bid_vol3:.2f} @ {bid3:.6f}, ask: {ask_vol3:.2f} @ {ask3:.6f})")
                 return None, 0.0
 
             volatility = max(
@@ -380,7 +384,7 @@ async def simulate_trade(exchange, pair1, pair2, pair3, trade_details):
             async with balance_lock:
                 if mock_balance['USDT'] < initial_balance * CONFIG['stop_loss_threshold']:
                     logger.error(f"Stop-loss triggered: Balance below threshold\n{traceback.format_exc()}")
-                    print_summary()
+                    await print_summary()
                     raise Exception("Stop-loss triggered")
             return True
         else:
@@ -394,7 +398,7 @@ async def run_exchange(exchange_name, exchange):
     console.print(f"[yellow]Loading markets for {exchange_name}[/yellow]")
     logger.info(f"Loading markets for {exchange_name}")
     try:
-        coins = await fetch_top_coins(exchange, CONFIG['coin_depth'])
+        coins = await fetch_top_coins(exchange, CONFIG['coin_count'])
         if len(coins) < 3:
             logger.error(f"Not enough coins ({len(coins)}) to form triplets on {exchange_name}")
             return
@@ -406,7 +410,7 @@ async def run_exchange(exchange_name, exchange):
                 if mock_balance['USDT'] < initial_balance * CONFIG['stop_loss_threshold']:
                     console.print(f"[bold red]Trading halted on {exchange_name}: Balance below stop-loss threshold[/bold red]")
                     logger.error(f"Trading halted on {exchange_name}: Balance below stop-loss threshold")
-                    print_summary()
+                    await print_summary()
                     break
             for pair1, pair2, pair3 in triplets:
                 logger.info(f"Checking arbitrage on {exchange_name} for {pair1}, {pair2}, {pair3}")
@@ -424,7 +428,7 @@ async def run_exchange(exchange_name, exchange):
     except Exception as e:
         console.print(f"[bold red]Fatal error on {exchange_name}: {e}[/bold red]")
         logger.error(f"Fatal error on {exchange_name}: {e}\n{traceback.format_exc()}")
-        print_summary()
+        await print_summary()
     finally:
         await exchange.close()
 
@@ -437,7 +441,7 @@ async def main():
     except KeyboardInterrupt:
         console.print("[bold yellow]Bot stopped by user.[/bold yellow]")
         logger.info("Bot stopped by user")
-        print_summary()
+        await print_summary()
     finally:
         console.print("[bold green]Bot stopped[/bold green]")
         logger.info("Bot stopped")
