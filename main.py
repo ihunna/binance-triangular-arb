@@ -125,6 +125,10 @@ for name in EXCHANGES:
             if name == 'bybit':
                 exchanges[name] = ccxt.bybit(CONFIG['exchanges'][name])
             elif name == 'kucoin':
+                if not API_KEYS[name]['passphrase']:
+                    logger.warning(f"KuCoin passphrase missing in .env. Prompting for manual input.")
+                    API_KEYS[name]['passphrase'] = input(f"Enter {name} Passphrase: ")
+                    CONFIG['exchanges']['kucoin']['passphrase'] = API_KEYS[name]['passphrase']
                 exchanges[name] = ccxt.kucoin(CONFIG['exchanges'][name])
             elif name == 'binance':
                 exchanges[name] = ccxt.binance(CONFIG['exchanges'][name])
@@ -138,6 +142,7 @@ for name in EXCHANGES:
         API_KEYS[name]['secret'] = input(f"Enter {name} Secret Key: ")
         if name == 'kucoin':
             API_KEYS[name]['passphrase'] = input(f"Enter {name} Passphrase: ")
+            CONFIG['exchanges']['kucoin']['passphrase'] = API_KEYS[name]['passphrase']
         if API_KEYS[name]['apiKey'] and API_KEYS[name]['secret']:
             try:
                 if name == 'bybit':
@@ -226,42 +231,48 @@ async def print_summary():
     table.add_row("Recent Profits", f"{[f'{p:.2f}%' for p in recent_profits]}")
     console.print(table)
 
-async def fetch_trading_fees(exchange):
+async def fetch_trading_fees(exchange, valid_pairs):
     try:
         fee_dict = {}
         fee_type = 'maker' if CONFIG['order_book_type'] == 'limit' else 'taker'
         default_fee = CONFIG['default_fee_rate'][exchange.id][fee_type]
         
         if exchange.id == 'kucoin':
-            await exchange.load_markets()
-            symbols = list(exchange.markets.keys())
-            logger.info(f"Fetching trading fees for {len(symbols)} pairs on {exchange.id}")
-            for symbol in symbols:
+            # Fetch fee for one liquid pair (BTC/USDT) and apply to all
+            liquid_pair = 'BTC/USDT'
+            if liquid_pair in valid_pairs:
                 try:
-                    fee_data = await exchange.fetch_trading_fee(symbol)
+                    fee_data = await exchange.fetch_trading_fee(liquid_pair)
                     fee_rate = fee_data[fee_type]
-                    if exchange.id == 'kucoin' and CONFIG['use_kcs_discount']:
-                        fee_rate *= 0.8
-                    fee_dict[symbol] = fee_rate
-                    logger.debug(f"Fetched fee for {symbol}: {fee_type}={fee_rate:.4f}")
+                    if CONFIG['use_kcs_discount']:
+                        fee_rate *= 0.8  # 20% discount with KCS
+                    fee_dict = {pair: fee_rate for pair in valid_pairs}
+                    logger.info(f"Fetched fee for {liquid_pair}: {fee_type}={fee_rate:.4f}, applying to {len(valid_pairs)} pairs on {exchange.id}")
                 except Exception as e:
-                    logger.warning(f"Error fetching fee for {symbol} on {exchange.id}: {e}. Using default fee {default_fee:.4f}")
-                    fee_dict[symbol] = default_fee
+                    logger.warning(f"Error fetching fee for {liquid_pair} on {exchange.id}: {e}. Using default fee {default_fee:.4f} for {len(valid_pairs)} pairs")
+                    fee_dict = {pair: default_fee for pair in valid_pairs}
+            else:
+                logger.warning(f"Liquid pair {liquid_pair} not in valid pairs. Using default fee {default_fee:.4f} for {len(valid_pairs)} pairs")
+                fee_dict = {pair: default_fee for pair in valid_pairs}
         else:
+            # Use fetch_trading_fees for Binance and Bybit
             fees = await exchange.fetch_trading_fees()
-            for symbol in fees:
-                fee_rate = fees[symbol][fee_type]
-                if exchange.id == 'binance' and CONFIG['use_bnb_discount']:
-                    fee_rate *= 0.75
-                fee_dict[symbol] = fee_rate
-                logger.debug(f"Fetched fee for {symbol}: {fee_type}={fee_rate:.4f}")
+            for pair in valid_pairs:
+                if pair in fees:
+                    fee_rate = fees[pair][fee_type]
+                    if exchange.id == 'binance' and CONFIG['use_bnb_discount']:
+                        fee_rate *= 0.75  # 25% discount with BNB
+                    fee_dict[pair] = fee_rate
+                    logger.debug(f"Fetched fee for {pair}: {fee_type}={fee_rate:.4f}")
+                else:
+                    logger.warning(f"Fee not found for {pair} on {exchange.id}. Using default fee {default_fee:.4f}")
+                    fee_dict[pair] = default_fee
+            logger.info(f"Fetched trading fees for {len(fee_dict)} pairs on {exchange.id}")
         
-        logger.info(f"Fetched trading fees for {len(fee_dict)} pairs on {exchange.id}")
         return fee_dict
     except Exception as e:
         logger.error(f"Error fetching trading fees for {exchange.id}: {e}\n{traceback.format_exc()}")
-        await exchange.load_markets()
-        fee_dict = {symbol: CONFIG['default_fee_rate'][exchange.id][fee_type] for symbol in exchange.markets}
+        fee_dict = {pair: CONFIG['default_fee_rate'][exchange.id][fee_type] for pair in valid_pairs}
         logger.info(f"Using default {fee_type} fees for {len(fee_dict)} pairs on {exchange.id}")
         return fee_dict
 
@@ -347,7 +358,7 @@ async def fetch_top_coins(exchange, coin_count):
         valid_pairs.sort(key=lambda x: x[1], reverse=True)
         base_coins = []
         for symbol, _ in valid_pairs:
-            base = symbol.split('/')
+            base = symbol.split('/')[0]
             if base not in base_coins and base not in quote_currencies:
                 base_coins.append(base)
                 if len(base_coins) >= coin_count:
@@ -374,7 +385,6 @@ async def generate_triplets(coins, exchange):
             pair2 = f"{inter}/{base}"
             pair3 = f"{inter}/{quote}"
             if pair1 in valid_pairs and pair2 in valid_pairs and pair3 in valid_pairs:
-                # Check if triplet returns to quote currency
                 base1, quote1 = pair1.split('/')
                 base2, quote2 = pair2.split('/')
                 base3, quote3 = pair3.split('/')
@@ -391,10 +401,10 @@ async def generate_triplets(coins, exchange):
                 if quote1_r == quote2_r and base3_r == base1_r and base2_r == inter:
                     triplets.append((pair1_r, pair2_r, pair3_r))
         logger.info(f"Generated {len(triplets)} triplets on {exchange.id}")
-        return triplets
+        return triplets, valid_pairs
     except Exception as e:
         logger.error(f"Error generating triplets on {exchange.id}: {e}\n{traceback.format_exc()}")
-        return []
+        return [], set()
 
 async def calculate_triangular_arbitrage(exchange, pair1, pair2, pair3, amount, avg_trades):
     try:
@@ -516,7 +526,7 @@ async def calculate_triangular_arbitrage(exchange, pair1, pair2, pair3, amount, 
                     dynamic_threshold = max(CONFIG['min_profit_threshold'], np.mean(valid_profits) * 0.8)
                 else:
                     dynamic_threshold = CONFIG['min_profit_threshold']
-                    recent_profits.clear()  # Reset to avoid persistent errors
+                    recent_profits.clear()
         if avg_profit_percentage < dynamic_threshold * 100:
             reasons.append(f"Profit too low: {avg_profit_percentage:.2f}% < {dynamic_threshold * 100:.2f}%")
             logger.info(f"No profitable trade for {pair1}, {pair2}, {pair3}: {', '.join(reasons)}")
@@ -578,14 +588,16 @@ async def run_exchange(exchange_name, exchange):
     console.print(f"[yellow]Loading markets for {exchange_name}[/yellow]")
     logger.info(f"Loading markets for {exchange_name}")
     try:
-        CONFIG['fee_rate'][exchange_name] = await fetch_trading_fees(exchange)
+        # Fetch coins and generate triplets first
         coins = await fetch_top_coins(exchange, CONFIG['coin_count'])
         if len(coins) < 3:
             logger.error(f"Not enough coins ({len(coins)}) to form triplets on {exchange_name}")
             return
-        triplets = await generate_triplets(coins, exchange)
+        triplets, valid_pairs = await generate_triplets(coins, exchange)
         console.print(f"[cyan]Found {len(triplets)} valid triplets on {exchange_name}[/cyan]")
         logger.info(f"Found {len(triplets)} valid triplets on {exchange_name}")
+        # Fetch fees only for valid pairs used in triplets
+        CONFIG['fee_rate'][exchange_name] = await fetch_trading_fees(exchange, valid_pairs)
         while True:
             async with balance_lock:
                 if mock_balance['USDT'] < initial_balance * CONFIG['stop_loss_threshold']:
