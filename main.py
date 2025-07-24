@@ -238,14 +238,13 @@ async def fetch_trading_fees(exchange, valid_pairs):
         default_fee = CONFIG['default_fee_rate'][exchange.id][fee_type]
         
         if exchange.id == 'kucoin':
-            # Fetch fee for one liquid pair (BTC/USDT) and apply to all
             liquid_pair = 'BTC/USDT'
             if liquid_pair in valid_pairs:
                 try:
                     fee_data = await exchange.fetch_trading_fee(liquid_pair)
                     fee_rate = fee_data[fee_type]
                     if CONFIG['use_kcs_discount']:
-                        fee_rate *= 0.8  # 20% discount with KCS
+                        fee_rate *= 0.8
                     fee_dict = {pair: fee_rate for pair in valid_pairs}
                     logger.info(f"Fetched fee for {liquid_pair}: {fee_type}={fee_rate:.4f}, applying to {len(valid_pairs)} pairs on {exchange.id}")
                 except Exception as e:
@@ -255,13 +254,12 @@ async def fetch_trading_fees(exchange, valid_pairs):
                 logger.warning(f"Liquid pair {liquid_pair} not in valid pairs. Using default fee {default_fee:.4f} for {len(valid_pairs)} pairs")
                 fee_dict = {pair: default_fee for pair in valid_pairs}
         else:
-            # Use fetch_trading_fees for Binance and Bybit
             fees = await exchange.fetch_trading_fees()
             for pair in valid_pairs:
                 if pair in fees:
                     fee_rate = fees[pair][fee_type]
                     if exchange.id == 'binance' and CONFIG['use_bnb_discount']:
-                        fee_rate *= 0.75  # 25% discount with BNB
+                        fee_rate *= 0.75
                     fee_dict[pair] = fee_rate
                     logger.debug(f"Fetched fee for {pair}: {fee_type}={fee_rate:.4f}")
                 else:
@@ -389,7 +387,7 @@ async def generate_triplets(coins, exchange):
                 base2, quote2 = pair2.split('/')
                 base3, quote3 = pair3.split('/')
                 if quote1 == quote3 and base2 == base1 and base3 == inter:
-                    triplets.append((pair1, pair2, pair3))
+                    triplets.append(('forward', pair1, pair2, pair3))
             # Reverse path: e.g., SOL/USDT, BTC/USDT, SOL/BTC
             pair1_r = f"{base}/{quote}"
             pair2_r = f"{inter}/{quote}"
@@ -399,14 +397,14 @@ async def generate_triplets(coins, exchange):
                 base2_r, quote2_r = pair2_r.split('/')
                 base3_r, quote3_r = pair3_r.split('/')
                 if quote1_r == quote2_r and base3_r == base1_r and base2_r == inter:
-                    triplets.append((pair1_r, pair2_r, pair3_r))
+                    triplets.append(('reverse', pair1_r, pair2_r, pair3_r))
         logger.info(f"Generated {len(triplets)} triplets on {exchange.id}")
         return triplets, valid_pairs
     except Exception as e:
         logger.error(f"Error generating triplets on {exchange.id}: {e}\n{traceback.format_exc()}")
         return [], set()
 
-async def calculate_triangular_arbitrage(exchange, pair1, pair2, pair3, amount, avg_trades):
+async def calculate_triangular_arbitrage(exchange, triplet_type, pair1, pair2, pair3, amount, avg_trades):
     try:
         prices = []
         reasons = []
@@ -468,15 +466,32 @@ async def calculate_triangular_arbitrage(exchange, pair1, pair2, pair3, amount, 
             base3, quote3 = pair3.split('/')
             amount1 = adjusted_amount / ask1  # Buy base1 with quote1
             amount1_after_fee = amount1 * (1 - fee1)
-            if quote2 == base1:
+            if triplet_type == 'forward':
+                # Forward: base1/quote1, base2/base1, base2/quote1
+                if quote2 != base1:
+                    reasons.append(f"Invalid forward triplet: quote2 ({quote2}) != base1 ({base1})")
+                    logger.error(f"Invalid forward triplet for {pair1}, {pair2}, {pair3}")
+                    return None, 0.0
                 amount2 = amount1_after_fee / ask2  # Buy base2 with base1
-            else:
-                amount2 = amount1_after_fee * bid2  # Sell base1 for quote2
-            amount2_after_fee = amount2 * (1 - fee2)
-            if base3 == base2 and quote3 == quote1:
+                amount2_after_fee = amount2 * (1 - fee2)
+                if base3 != base2 or quote3 != quote1:
+                    reasons.append(f"Invalid forward triplet: base3 ({base3}) != base2 ({base2}) or quote3 ({quote3}) != quote1 ({quote1})")
+                    logger.error(f"Invalid forward triplet for {pair1}, {pair2}, {pair3}")
+                    return None, 0.0
                 final_amount = amount2_after_fee * bid3  # Sell base2 for quote1
             else:
-                final_amount = amount2_after_fee / ask3  # Buy quote1 with base2
+                # Reverse: base1/quote1, base2/quote1, base1/base2
+                if quote2 != quote1:
+                    reasons.append(f"Invalid reverse triplet: quote2 ({quote2}) != quote1 ({quote1})")
+                    logger.error(f"Invalid reverse triplet for {pair1}, {pair2}, {pair3}")
+                    return None, 0.0
+                amount2 = amount1_after_fee / (1 / bid2)  # Sell base1 for base2 (bid2 is base2/quote1, invert to quote1/base2)
+                amount2_after_fee = amount2 * (1 - fee2)
+                if base3 != base1 or quote3 != base2:
+                    reasons.append(f"Invalid reverse triplet: base3 ({base3}) != base1 ({base1}) or quote3 ({quote3}) != base2 ({base2})")
+                    logger.error(f"Invalid reverse triplet for {pair1}, {pair2}, {pair3}")
+                    return None, 0.0
+                final_amount = amount2_after_fee * bid3  # Sell base1 for base2
             final_amount_after_fee = final_amount * (1 - fee3)
             # Convert back to USDT if final_amount is not in USDT
             if quote3 != 'USDT':
@@ -497,10 +512,10 @@ async def calculate_triangular_arbitrage(exchange, pair1, pair2, pair3, amount, 
                 logger.warning(f"Unrealistic profit for {pair1}, {pair2}, {pair3}: {profit_percentage:.2f}%")
                 return None, 0.0
             logger.info(
-                f"Calculation for {pair1}, {pair2}, {pair3}: "
+                f"Calculation for {pair1}, {pair2}, {pair3} ({triplet_type}): "
                 f"Step 1: {adjusted_amount:.2f} {quote1} -> {amount1:.6f} {base1} @ ask {ask1:.6f}, after fee {amount1_after_fee:.6f}; "
-                f"Step 2: {amount1_after_fee:.6f} {base1} -> {amount2:.6f} {base2} @ {'ask' if quote2 == base1 else 'bid'} {ask2 if quote2 == base1 else bid2:.6f}, after fee {amount2_after_fee:.6f}; "
-                f"Step 3: {amount2_after_fee:.6f} {base2} -> {final_amount:.6f} {quote3} @ {'bid' if base3 == base2 else 'ask'} {bid3 if base3 == base2 else ask3:.6f}, after fee {final_amount_after_fee:.6f} USDT"
+                f"Step 2: {amount1_after_fee:.6f} {base1} -> {amount2:.6f} {base2} @ {'ask' if triplet_type == 'forward' else 'bid (inverted)'} {ask2 if triplet_type == 'forward' else (1/bid2):.6f}, after fee {amount2_after_fee:.6f}; "
+                f"Step 3: {amount2_after_fee:.6f} {base2} -> {final_amount:.6f} {quote3} @ bid {bid3:.6f}, after fee {final_amount_after_fee:.6f} USDT"
             )
             prices.append({
                 'initial_amount': adjusted_amount,
@@ -588,7 +603,6 @@ async def run_exchange(exchange_name, exchange):
     console.print(f"[yellow]Loading markets for {exchange_name}[/yellow]")
     logger.info(f"Loading markets for {exchange_name}")
     try:
-        # Fetch coins and generate triplets first
         coins = await fetch_top_coins(exchange, CONFIG['coin_count'])
         if len(coins) < 3:
             logger.error(f"Not enough coins ({len(coins)}) to form triplets on {exchange_name}")
@@ -596,7 +610,6 @@ async def run_exchange(exchange_name, exchange):
         triplets, valid_pairs = await generate_triplets(coins, exchange)
         console.print(f"[cyan]Found {len(triplets)} valid triplets on {exchange_name}[/cyan]")
         logger.info(f"Found {len(triplets)} valid triplets on {exchange_name}")
-        # Fetch fees only for valid pairs used in triplets
         CONFIG['fee_rate'][exchange_name] = await fetch_trading_fees(exchange, valid_pairs)
         while True:
             async with balance_lock:
@@ -605,13 +618,13 @@ async def run_exchange(exchange_name, exchange):
                     logger.error(f"Trading halted on {exchange_name}: Balance below stop-loss threshold")
                     await print_summary()
                     break
-            for pair1, pair2, pair3 in triplets:
-                logger.info(f"Checking arbitrage on {exchange_name} for {pair1}, {pair2}, {pair3}")
+            for triplet_type, pair1, pair2, pair3 in triplets:
+                logger.info(f"Checking arbitrage on {exchange_name} for {pair1}, {pair2}, {pair3} ({triplet_type})")
                 async with balance_lock:
                     max_trade_amount = mock_balance['USDT'] * CONFIG['max_exposure']
                     trade_amount = min(max_trade_amount, CONFIG['stake_amount'])
                 trade_details, final_amount = await calculate_triangular_arbitrage(
-                    exchange, pair1, pair2, pair3, trade_amount, CONFIG['avg_trades']
+                    exchange, triplet_type, pair1, pair2, pair3, trade_amount, CONFIG['avg_trades']
                 )
                 if trade_details and final_amount > trade_details['initial_amount']:
                     await simulate_trade(exchange, pair1, pair2, pair3, trade_details)
