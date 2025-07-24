@@ -89,10 +89,8 @@ CONFIG = {
             'active': True,
             'apiKey': API_KEYS['kucoin']['apiKey'],
             'secret': API_KEYS['kucoin']['secret'],
-            'password': API_KEYS['kucoin']['passphrase'],
-            'enableRateLimit': True,
-            'retries': 3,
-            'retryDelay': 1000
+            'passphrase': API_KEYS['kucoin']['passphrase'],
+            'enableRateLimit': True
         },
         'binance': {
             'active': False,
@@ -127,52 +125,33 @@ CONFIG = {
 
 # Initialize exchanges
 async def initialize_exchange(name, config):
-    max_retries = config.get('retries', 3)
-    retry_delay = config.get('retryDelay', 1000) / 1000  # Convert to seconds
     exchange = None
-    for attempt in range(max_retries):
-        try:
-            if name == 'bybit':
-                exchange = ccxt.bybit(config)
-            elif name == 'kucoin':
-                if not config.get('password'):
-                    logger.warning(f"KuCoin passphrase missing in .env. Prompting for manual input.")
-                    config['password'] = input(f"Enter {name} Passphrase: ").strip()
-                    API_KEYS[name]['passphrase'] = config['password']
-                    logger.info(f"KuCoin passphrase set: length={len(config['password'])}")
-                exchange = ccxt.kucoin(config)
-                await exchange.load_markets()
-                logger.info(f"KuCoin authentication successful")
-            elif name == 'binance':
-                exchange = ccxt.binance(config)
-            logger.info(f"Initialized {name} exchange")
-            return exchange
-        except ccxt.AuthenticationError as e:
-            logger.error(f"Authentication failed for {name} on attempt {attempt + 1}/{max_retries}: {e}")
-            if exchange:
-                await exchange.close()
-                exchange = None
-            if name == 'kucoin' and attempt < max_retries - 1:
-                logger.warning(f"Retrying KuCoin authentication with new passphrase")
-                config['password'] = input(f"KuCoin authentication failed. Enter new Passphrase: ").strip()
-                API_KEYS[name]['passphrase'] = config['password']
-                logger.info(f"KuCoin passphrase set: length={len(config['password'])}")
-                await asyncio.sleep(retry_delay * (2 ** attempt))  # Exponential backoff
-                continue
-            logger.error(f"Failed to initialize {name} after {max_retries} attempts: {e}\n{traceback.format_exc()}")
-            return None
-        except Exception as e:
-            logger.error(f"Failed to initialize {name} on attempt {attempt + 1}/{max_retries}: {e}\n{traceback.format_exc()}")
-            if exchange:
-                await exchange.close()
-                exchange = None
-            if attempt < max_retries - 1:
-                await asyncio.sleep(retry_delay * (2 ** attempt))
-                continue
-            return None
-    if exchange:
-        await exchange.close()
-    return None
+    try:
+        if name == 'bybit':
+            exchange = ccxt.bybit(config)
+        elif name == 'kucoin':
+            if not config.get('passphrase'):
+                logger.warning(f"KuCoin passphrase missing in .env. Prompting for manual input.")
+                config['passphrase'] = input(f"Enter {name} Passphrase: ").strip()
+                API_KEYS[name]['passphrase'] = config['passphrase']
+                logger.info(f"KuCoin passphrase set: length={len(config['passphrase'])}")
+            exchange = ccxt.kucoin(config)
+            await exchange.load_markets()
+            logger.info(f"KuCoin authentication successful")
+        elif name == 'binance':
+            exchange = ccxt.binance(config)
+        logger.info(f"Initialized {name} exchange")
+        return exchange
+    except ccxt.AuthenticationError as e:
+        logger.error(f"Authentication failed for {name}: {e}\n{traceback.format_exc()}")
+        if exchange:
+            await exchange.close()
+        return None
+    except Exception as e:
+        logger.error(f"Failed to initialize {name}: {e}\n{traceback.format_exc()}")
+        if exchange:
+            await exchange.close()
+        return None
 
 exchanges = {}
 for name in EXCHANGES:
