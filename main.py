@@ -71,7 +71,10 @@ for exchange in EXCHANGES:
     logger.info(f"{exchange.upper()}_API_KEY loaded: {'True' if API_KEYS[exchange]['apiKey'] else 'False'}")
     logger.info(f"{exchange.upper()}_SECRET loaded: {'True' if API_KEYS[exchange]['secret'] else 'False'}")
     if exchange == 'kucoin':
-        logger.info(f"{exchange.upper()}_PASSPHRASE loaded: {'True' if API_KEYS[exchange]['passphrase'] else 'False'}")
+        passphrase = API_KEYS[exchange]['passphrase']
+        logger.info(f"{exchange.upper()}_PASSPHRASE loaded: {'True' if passphrase else 'False'}")
+        if passphrase:
+            logger.info(f"KuCoin passphrase characteristics: length={len(passphrase)}")
 
 # Configuration
 CONFIG = {
@@ -126,6 +129,7 @@ CONFIG = {
 async def initialize_exchange(name, config):
     max_retries = config.get('retries', 3)
     retry_delay = config.get('retryDelay', 1000) / 1000  # Convert to seconds
+    exchange = None
     for attempt in range(max_retries):
         try:
             if name == 'bybit':
@@ -135,8 +139,8 @@ async def initialize_exchange(name, config):
                     logger.warning(f"KuCoin passphrase missing in .env. Prompting for manual input.")
                     config['password'] = input(f"Enter {name} Passphrase: ").strip()
                     API_KEYS[name]['passphrase'] = config['password']
+                    logger.info(f"KuCoin passphrase set: length={len(config['password'])}")
                 exchange = ccxt.kucoin(config)
-                # Verify KuCoin authentication
                 await exchange.load_markets()
                 logger.info(f"KuCoin authentication successful")
             elif name == 'binance':
@@ -145,20 +149,29 @@ async def initialize_exchange(name, config):
             return exchange
         except ccxt.AuthenticationError as e:
             logger.error(f"Authentication failed for {name} on attempt {attempt + 1}/{max_retries}: {e}")
+            if exchange:
+                await exchange.close()
+                exchange = None
             if name == 'kucoin' and attempt < max_retries - 1:
                 logger.warning(f"Retrying KuCoin authentication with new passphrase")
                 config['password'] = input(f"KuCoin authentication failed. Enter new Passphrase: ").strip()
                 API_KEYS[name]['passphrase'] = config['password']
+                logger.info(f"KuCoin passphrase set: length={len(config['password'])}")
                 await asyncio.sleep(retry_delay * (2 ** attempt))  # Exponential backoff
                 continue
             logger.error(f"Failed to initialize {name} after {max_retries} attempts: {e}\n{traceback.format_exc()}")
             return None
         except Exception as e:
             logger.error(f"Failed to initialize {name} on attempt {attempt + 1}/{max_retries}: {e}\n{traceback.format_exc()}")
+            if exchange:
+                await exchange.close()
+                exchange = None
             if attempt < max_retries - 1:
                 await asyncio.sleep(retry_delay * (2 ** attempt))
                 continue
             return None
+    if exchange:
+        await exchange.close()
     return None
 
 exchanges = {}
@@ -174,6 +187,7 @@ for name in EXCHANGES:
         if name == 'kucoin':
             API_KEYS[name]['passphrase'] = input(f"Enter {name} Passphrase: ").strip()
             CONFIG['exchanges']['kucoin']['password'] = API_KEYS[name]['passphrase']
+            logger.info(f"KuCoin passphrase set: length={len(API_KEYS[name]['passphrase'])}")
         if API_KEYS[name]['apiKey'] and API_KEYS[name]['secret']:
             exchange = asyncio.run(initialize_exchange(name, CONFIG['exchanges'][name]))
             if exchange:
