@@ -333,13 +333,17 @@ async def generate_triplets(coins, exchange):
 async def calculate_triangular_arbitrage(exchange, pair1, pair2, pair3, amount, avg_trades):
     try:
         prices = []
+        reasons = []  # Collect reasons for no opportunity
         for _ in range(avg_trades):
             bid1, ask1, vol1, quote_curr1, usdt_vol1, bid_vol1, ask_vol1 = await fetch_market_data(exchange, pair1)
             bid2, ask2, vol2, quote_curr2, usdt_vol2, bid_vol2, ask_vol2 = await fetch_market_data(exchange, pair2)
             bid3, ask3, vol3, quote_curr3, usdt_vol3, bid_vol3, ask_vol3 = await fetch_market_data(exchange, pair3)
             
+            # Check for missing price data
             if not all([bid1, ask1, bid2, ask2, bid3, ask3]):
-                logger.error(f"Missing price data for {pair1}, {pair2}, {pair3} on {exchange.id}")
+                reasons.append(f"Missing price data: {pair1} (bid={bid1}, ask={ask1}), "
+                              f"{pair2} (bid={bid2}, ask={ask2}), {pair3} (bid={bid3}, ask={ask3})")
+                logger.error(f"Missing price data for {pair1}, {pair2}, {pair3} on {exchange.id}: {reasons[-1]}")
                 return None, 0.0
 
             # Adjust stake amount for limit order book based on pair1's ask volume
@@ -352,7 +356,7 @@ async def calculate_triangular_arbitrage(exchange, pair1, pair2, pair3, amount, 
                     adjusted_amount = usdt_ask_vol1
                     logger.info(f"Adjusted stake amount from {amount:.2f} to {adjusted_amount:.2f} USDT due to low ask volume on {pair1}")
 
-            # Warn about low volume in USDT
+            # Check volume
             min_usdt_volume = min(usdt_vol1, usdt_vol2, usdt_vol3)
             if min_usdt_volume < 1000:
                 volume_log = (
@@ -363,29 +367,33 @@ async def calculate_triangular_arbitrage(exchange, pair1, pair2, pair3, amount, 
                     f"{pair3} ({'24h' if CONFIG['order_book_type'] == 'market' else 'ask'}: "
                     f"{vol3 if vol3 is not None else ask_vol3:.2f} {quote_curr3}, {usdt_vol3:.2f} USDT @ bid {bid3:.6f}, ask {ask3:.6f})"
                 )
-                logger.warning(f"Low {'24h' if CONFIG['order_book_type'] == 'market' else 'order book'} volume for "
-                              f"{pair1}, {pair2}, {pair3} on {exchange.id}. Trade amount: {adjusted_amount:.2f}, "
-                              f"Volumes: {volume_log}")
+                reasons.append(f"Low {'24h' if CONFIG['order_book_type'] == 'market' else 'order book'} volume: {min_usdt_volume:.2f} USDT < 1000")
+                logger.warning(f"Low volume for {pair1}, {pair2}, {pair3} on {exchange.id}. Trade amount: {adjusted_amount:.2f}, Volumes: {volume_log}")
                 return None, 0.0
 
+            # Check volatility
             volatility = max(
                 await calculate_volatility(exchange, pair1),
                 await calculate_volatility(exchange, pair2),
                 await calculate_volatility(exchange, pair3)
             )
             if volatility > CONFIG['max_volatility']:
+                reasons.append(f"Volatility too high: {volatility:.4f} > {CONFIG['max_volatility']}")
                 logger.info(f"Volatility too high ({volatility:.4f}) for {pair1}, {pair2}, {pair3}")
                 return None, 0.0
 
+            # Check slippage
             slippage = max(
                 abs((ask1 - bid1) / bid1),
                 abs((ask2 - bid2) / bid2),
                 abs((ask3 - bid3) / bid3)
             )
             if slippage > CONFIG['slippage_tolerance']:
+                reasons.append(f"Slippage too high: {slippage:.4f} > {CONFIG['slippage_tolerance']}")
                 logger.info(f"Slippage too high ({slippage:.4f}) for {pair1}, {pair2}, {pair3}")
                 return None, 0.0
 
+            # Calculate arbitrage
             amount1 = adjusted_amount / ask1
             amount1_after_fee = amount1 * (1 - CONFIG['fee_rate'][exchange.id])
             amount2 = amount1_after_fee / ask2
@@ -414,12 +422,42 @@ async def calculate_triangular_arbitrage(exchange, pair1, pair2, pair3, amount, 
             'avg_profit_percentage': avg_profit_percentage,
             'prices': prices
         }
+
+        # Check profit threshold
+        dynamic_threshold = CONFIG['min_profit_threshold']
+        async with history_lock:
+            if recent_profits:
+                dynamic_threshold = max(CONFIG['min_profit_threshold'], np.mean(recent_profits) * 0.8)
+        if avg_profit_percentage < dynamic_threshold:
+            reasons.append(f"Profit too low: {avg_profit_percentage:.2f}% < {dynamic_threshold:.2f}%")
+            logger.info(f"No profitable trade for {pair1}, {pair2}, {pair3}: {', '.join(reasons)}")
+            return None, 0.0
+
+        # Log successful opportunity
+        volume_log = (
+            f"{pair1} ({'24h' if CONFIG['order_book_type'] == 'market' else 'ask'}: "
+            f"{vol1 if vol1 is not None else ask_vol1:.2f} {quote_curr1}, {usdt_vol1:.2f} USDT @ bid {bid1:.6f}, ask {ask1:.6f}), "
+            f"{pair2} ({'24h' if CONFIG['order_book_type'] == 'market' else 'ask'}: "
+            f"{vol2 if vol2 is not None else ask_vol2:.2f} {quote_curr2}, {usdt_vol2:.2f} USDT @ bid {bid2:.6f}, ask {ask2:.6f}), "
+            f"{pair3} ({'24h' if CONFIG['order_book_type'] == 'market' else 'ask'}: "
+            f"{vol3 if vol3 is not None else ask_vol3:.2f} {quote_curr3}, {usdt_vol3:.2f} USDT @ bid {bid3:.6f}, ask {ask3:.6f})"
+        )
+        logger.info(
+            f"Arbitrage opportunity found for {pair1}, {pair2}, {pair3} on {exchange.id}: "
+            f"Profit {avg_profit_percentage:.2f}% >= {dynamic_threshold:.2f}%, "
+            f"Initial amount {adjusted_amount:.2f} USDT, Final amount {final_amount_after_fee:.2f} USDT, "
+            f"Volume: {volume_log}, "
+            f"Volatility: {volatility:.4f} <= {CONFIG['max_volatility']}, "
+            f"Slippage: {slippage:.4f} <= {CONFIG['slippage_tolerance']}"
+        )
+
         # Log stake amount reset for next triplet
         if CONFIG['order_book_type'] == 'limit' and adjusted_amount != amount:
             logger.info(f"Stake amount reset to {CONFIG['stake_amount']:.2f} USDT for next triplet")
         return trade_details, prices[-1]['final_amount']
     except Exception as e:
-        logger.error(f"Error calculating arbitrage on {exchange.id}: {e}\n{traceback.format_exc()}")
+        reasons.append(f"Calculation error: {str(e)}")
+        logger.error(f"Error calculating arbitrage on {exchange.id} for {pair1}, {pair2}, {pair3}: {', '.join(reasons)}\n{traceback.format_exc()}")
         return None, 0.0
 
 async def simulate_trade(exchange, pair1, pair2, pair3, trade_details):
@@ -430,29 +468,21 @@ async def simulate_trade(exchange, pair1, pair2, pair3, trade_details):
         final_amount = trade_details['final_amount']
         profit = trade_details['avg_profit']
         profit_percentage = trade_details['avg_profit_percentage']
-        dynamic_threshold = CONFIG['min_profit_threshold']
+        async with balance_lock:
+            mock_balance['USDT'] = mock_balance['USDT'] - initial_amount + final_amount
         async with history_lock:
-            if recent_profits:
-                dynamic_threshold = max(CONFIG['min_profit_threshold'], np.mean(recent_profits) * 0.8)
-        if profit_percentage >= dynamic_threshold:
-            async with balance_lock:
-                mock_balance['USDT'] = mock_balance['USDT'] - initial_amount + final_amount
-            async with history_lock:
-                recent_profits.append(profit_percentage)
-                trade_history.append(trade_details)
-                if len(recent_profits) > 10:
-                    recent_profits.pop(0)
-            print_trade_update(exchange, pair1, pair2, pair3, trade_details)
-            await log_trade_to_csv(exchange, pair1, pair2, pair3, trade_details)
-            async with balance_lock:
-                if mock_balance['USDT'] < initial_balance * CONFIG['stop_loss_threshold']:
-                    logger.error(f"Stop-loss triggered: Balance below threshold")
-                    await print_summary()
-                    raise Exception("Stop-loss triggered")
-            return True
-        else:
-            logger.info(f"No profitable trade. Profit {profit_percentage:.2f}% below threshold {dynamic_threshold}%")
-            return False
+            recent_profits.append(profit_percentage)
+            trade_history.append(trade_details)
+            if len(recent_profits) > 10:
+                recent_profits.pop(0)
+        print_trade_update(exchange, pair1, pair2, pair3, trade_details)
+        await log_trade_to_csv(exchange, pair1, pair2, pair3, trade_details)
+        async with balance_lock:
+            if mock_balance['USDT'] < initial_balance * CONFIG['stop_loss_threshold']:
+                logger.error(f"Stop-loss triggered: Balance below threshold")
+                await print_summary()
+                raise Exception("Stop-loss triggered")
+        return True
     except Exception as e:
         logger.error(f"Error simulating trade on {exchange.id}: {e}\n{traceback.format_exc()}")
         return False
@@ -486,7 +516,7 @@ async def run_exchange(exchange_name, exchange):
                 if trade_details and final_amount > trade_details['initial_amount']:
                     await simulate_trade(exchange, pair1, pair2, pair3, trade_details)
                 else:
-                    logger.info(f"No arbitrage opportunity on {exchange_name} for {pair1}, {pair2}, {pair3}")
+                    logger.info(f"No arbitrage opportunity on {exchange_name} for {pair1}, {pair2}, {pair3}: No trade details or unprofitable")
                 await asyncio.sleep(CONFIG['sleep_interval'])
     except Exception as e:
         console.print(f"[bold red]Fatal error on {exchange_name}: {e}[/bold red]")
