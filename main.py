@@ -103,7 +103,9 @@ CONFIG = {
     'sleep_interval': 5,
     'initial_balance': 10000.0,
     'slippage_tolerance': 0.005,
-    'trade_log_file': 'trades.csv'
+    'trade_log_file': 'trades.csv',
+    'order_book_type': 'market',  # Options: 'market' or 'limit'
+    'stake_amount': 1000.0  # Base trade amount in USDT
 }
 
 # Initialize exchanges
@@ -217,19 +219,62 @@ async def print_summary():
 
 async def fetch_market_data(exchange, symbol):
     try:
-        ticker = await exchange.fetch_ticker(symbol)
-        bid = ticker['bid'] if 'bid' in ticker else None
-        ask = ticker['ask'] if 'ask' in ticker else None
-        volume = ticker.get('quoteVolume', 0)  # 24h quote volume in USDT
-        return bid, ask, volume
+        quote_currency = symbol.split('/')[1]
+        if CONFIG['order_book_type'] == 'market':
+            ticker = await exchange.fetch_ticker(symbol)
+            bid = ticker['bid'] if 'bid' in ticker else None
+            ask = ticker['ask'] if 'ask' in ticker else None
+            quote_volume = ticker.get('quoteVolume', 0)
+            # Convert quote volume to USDT
+            usdt_volume = quote_volume
+            if quote_currency != 'USDT':
+                usdt_pair = f"{quote_currency}/USDT"
+                try:
+                    usdt_ticker = await exchange.fetch_ticker(usdt_pair)
+                    bid_price = usdt_ticker['bid'] if 'bid' in usdt_ticker else None
+                    if bid_price:
+                        usdt_volume = quote_volume * bid_price
+                    else:
+                        logger.warning(f"No bid price for {usdt_pair}. Assuming zero USDT volume.")
+                        usdt_volume = 0
+                except Exception as e:
+                    logger.warning(f"Error fetching {usdt_pair} for volume conversion: {e}. Assuming zero USDT volume.")
+                    usdt_volume = 0
+            return bid, ask, quote_volume, quote_currency, usdt_volume, None, None
+        else:  # limit order book
+            order_book = await exchange.fetch_order_book(symbol, limit=1)
+            bid = order_book['bids'][0][0] if order_book['bids'] else None
+            ask = order_book['asks'][0][0] if order_book['asks'] else None
+            bid_volume = order_book['bids'][0][1] if order_book['bids'] else 0
+            ask_volume = order_book['asks'][0][1] if order_book['asks'] else 0
+            # Convert volumes to USDT
+            usdt_bid_volume = bid_volume
+            usdt_ask_volume = ask_volume
+            if quote_currency != 'USDT':
+                usdt_pair = f"{quote_currency}/USDT"
+                try:
+                    usdt_ticker = await exchange.fetch_ticker(usdt_pair)
+                    bid_price = usdt_ticker['bid'] if 'bid' in usdt_ticker else None
+                    if bid_price:
+                        usdt_bid_volume = bid_volume * bid_price
+                        usdt_ask_volume = ask_volume * bid_price
+                    else:
+                        logger.warning(f"No bid price for {usdt_pair}. Assuming zero USDT volume.")
+                        usdt_bid_volume = 0
+                        usdt_ask_volume = 0
+                except Exception as e:
+                    logger.warning(f"Error fetching {usdt_pair} for volume conversion: {e}. Assuming zero USDT volume.")
+                    usdt_bid_volume = 0
+                    usdt_ask_volume = 0
+            return bid, ask, None, quote_currency, usdt_ask_volume, bid_volume, ask_volume
     except ccxt.RateLimitExceeded as e:
         logger.warning(f"Rate limit exceeded on {exchange.id}. Backing off...")
         logger.error(f"Rate limit error details: {e}\n{traceback.format_exc()}")
         await asyncio.sleep(2 ** int(math.log2(random.randint(1, 5))))
-        return None, None, 0
+        return None, None, 0, None, 0, None, None
     except Exception as e:
         logger.error(f"Error fetching market data for {symbol} on {exchange.id}: {e}\n{traceback.format_exc()}")
-        return None, None, 0
+        return None, None, 0, None, 0, None, None
 
 async def calculate_volatility(exchange, symbol, periods=5, interval='1m'):
     try:
@@ -289,22 +334,39 @@ async def calculate_triangular_arbitrage(exchange, pair1, pair2, pair3, amount, 
     try:
         prices = []
         for _ in range(avg_trades):
-            bid1, ask1, vol1 = await fetch_market_data(exchange, pair1)
-            bid2, ask2, vol2 = await fetch_market_data(exchange, pair2)
-            bid3, ask3, vol3 = await fetch_market_data(exchange, pair3)
+            bid1, ask1, vol1, quote_curr1, usdt_vol1, bid_vol1, ask_vol1 = await fetch_market_data(exchange, pair1)
+            bid2, ask2, vol2, quote_curr2, usdt_vol2, bid_vol2, ask_vol2 = await fetch_market_data(exchange, pair2)
+            bid3, ask3, vol3, quote_curr3, usdt_vol3, bid_vol3, ask_vol3 = await fetch_market_data(exchange, pair3)
             
             if not all([bid1, ask1, bid2, ask2, bid3, ask3]):
                 logger.error(f"Missing price data for {pair1}, {pair2}, {pair3} on {exchange.id}")
                 return None, 0.0
 
-            # Optional: Warn about low 24h volume (e.g., < 1000 USDT)
-            min_volume = min(vol1, vol2, vol3)
-            if min_volume < 1000:
-                logger.warning(f"Low 24h volume for {pair1}, {pair2}, {pair3} on {exchange.id}. "
-                              f"Trade amount: {amount:.2f}, "
-                              f"Volumes: {pair1} (24h: {vol1:.2f} USDT @ bid {bid1:.6f}, ask {ask1:.6f}), "
-                              f"{pair2} (24h: {vol2:.2f} USDT @ bid {bid2:.6f}, ask {ask2:.6f}), "
-                              f"{pair3} (24h: {vol3:.2f} USDT @ bid {bid3:.6f}, ask {ask3:.6f})")
+            # Adjust stake amount for limit order book based on pair1's ask volume
+            adjusted_amount = amount
+            if CONFIG['order_book_type'] == 'limit' and ask_vol1 is not None:
+                # For pair1, we buy the base currency (e.g., BTC in BTC/USDT) using USDT
+                # ask_vol1 is in base currency units (e.g., BTC), convert to USDT
+                usdt_ask_vol1 = ask_vol1 * ask1 if quote_curr1 == 'USDT' else ask_vol1 * (await exchange.fetch_ticker(f"{quote_curr1}/USDT"))['bid']
+                if usdt_ask_vol1 < amount:
+                    adjusted_amount = usdt_ask_vol1
+                    logger.info(f"Adjusted stake amount from {amount:.2f} to {adjusted_amount:.2f} USDT due to low ask volume on {pair1}")
+
+            # Warn about low volume in USDT
+            min_usdt_volume = min(usdt_vol1, usdt_vol2, usdt_vol3)
+            if min_usdt_volume < 1000:
+                volume_log = (
+                    f"{pair1} ({'24h' if CONFIG['order_book_type'] == 'market' else 'ask'}: "
+                    f"{vol1 if vol1 is not None else ask_vol1:.2f} {quote_curr1}, {usdt_vol1:.2f} USDT @ bid {bid1:.6f}, ask {ask1:.6f}), "
+                    f"{pair2} ({'24h' if CONFIG['order_book_type'] == 'market' else 'ask'}: "
+                    f"{vol2 if vol2 is not None else ask_vol2:.2f} {quote_curr2}, {usdt_vol2:.2f} USDT @ bid {bid2:.6f}, ask {ask2:.6f}), "
+                    f"{pair3} ({'24h' if CONFIG['order_book_type'] == 'market' else 'ask'}: "
+                    f"{vol3 if vol3 is not None else ask_vol3:.2f} {quote_curr3}, {usdt_vol3:.2f} USDT @ bid {bid3:.6f}, ask {ask3:.6f})"
+                )
+                logger.warning(f"Low {'24h' if CONFIG['order_book_type'] == 'market' else 'order book'} volume for "
+                              f"{pair1}, {pair2}, {pair3} on {exchange.id}. Trade amount: {adjusted_amount:.2f}, "
+                              f"Volumes: {volume_log}")
+                return None, 0.0
 
             volatility = max(
                 await calculate_volatility(exchange, pair1),
@@ -324,18 +386,18 @@ async def calculate_triangular_arbitrage(exchange, pair1, pair2, pair3, amount, 
                 logger.info(f"Slippage too high ({slippage:.4f}) for {pair1}, {pair2}, {pair3}")
                 return None, 0.0
 
-            amount1 = amount / ask1
+            amount1 = adjusted_amount / ask1
             amount1_after_fee = amount1 * (1 - CONFIG['fee_rate'][exchange.id])
             amount2 = amount1_after_fee / ask2
             amount2_after_fee = amount2 * (1 - CONFIG['fee_rate'][exchange.id])
             final_amount = amount2_after_fee * bid3
             final_amount_after_fee = final_amount * (1 - CONFIG['fee_rate'][exchange.id])
 
-            profit = final_amount_after_fee - amount
-            profit_percentage = (profit / amount) * 100
+            profit = final_amount_after_fee - adjusted_amount
+            profit_percentage = (profit / adjusted_amount) * 100
 
             prices.append({
-                'initial_amount': amount,
+                'initial_amount': adjusted_amount,
                 'final_amount': final_amount_after_fee,
                 'profit': profit,
                 'profit_percentage': profit_percentage
@@ -345,13 +407,17 @@ async def calculate_triangular_arbitrage(exchange, pair1, pair2, pair3, amount, 
 
         avg_profit = np.mean([p['profit'] for p in prices])
         avg_profit_percentage = np.mean([p['profit_percentage'] for p in prices])
-        return {
-            'initial_amount': amount,
+        trade_details = {
+            'initial_amount': adjusted_amount,
             'final_amount': prices[-1]['final_amount'],
             'avg_profit': avg_profit,
             'avg_profit_percentage': avg_profit_percentage,
             'prices': prices
-        }, prices[-1]['final_amount']
+        }
+        # Log stake amount reset for next triplet
+        if CONFIG['order_book_type'] == 'limit' and adjusted_amount != amount:
+            logger.info(f"Stake amount reset to {CONFIG['stake_amount']:.2f} USDT for next triplet")
+        return trade_details, prices[-1]['final_amount']
     except Exception as e:
         logger.error(f"Error calculating arbitrage on {exchange.id}: {e}\n{traceback.format_exc()}")
         return None, 0.0
@@ -380,7 +446,7 @@ async def simulate_trade(exchange, pair1, pair2, pair3, trade_details):
             await log_trade_to_csv(exchange, pair1, pair2, pair3, trade_details)
             async with balance_lock:
                 if mock_balance['USDT'] < initial_balance * CONFIG['stop_loss_threshold']:
-                    logger.error(f"Stop-loss triggered: Balance below threshold\n{traceback.format_exc()}")
+                    logger.error(f"Stop-loss triggered: Balance below threshold")
                     await print_summary()
                     raise Exception("Stop-loss triggered")
             return True
@@ -413,11 +479,11 @@ async def run_exchange(exchange_name, exchange):
                 logger.info(f"Checking arbitrage on {exchange_name} for {pair1}, {pair2}, {pair3}")
                 async with balance_lock:
                     max_trade_amount = mock_balance['USDT'] * CONFIG['max_exposure']
-                    trade_amount = min(max_trade_amount, CONFIG['initial_balance'] * 0.1)
+                    trade_amount = min(max_trade_amount, CONFIG['stake_amount'])
                 trade_details, final_amount = await calculate_triangular_arbitrage(
                     exchange, pair1, pair2, pair3, trade_amount, CONFIG['avg_trades']
                 )
-                if trade_details and final_amount > trade_amount:
+                if trade_details and final_amount > trade_details['initial_amount']:
                     await simulate_trade(exchange, pair1, pair2, pair3, trade_details)
                 else:
                     logger.info(f"No arbitrage opportunity on {exchange_name} for {pair1}, {pair2}, {pair3}")
