@@ -81,7 +81,7 @@ CONFIG = {
             'active': True,
             'apiKey': API_KEYS['kucoin']['apiKey'],
             'secret': API_KEYS['kucoin']['secret'],
-            'passphrase': API_KEYS['kucoin']['passphrase'],
+            'password': API_KEYS['kucoin']['passphrase'],  # Use 'password' for ccxt.kucoin
             'enableRateLimit': True,
             'retries': 3,
             'retryDelay': 1000
@@ -93,19 +93,19 @@ CONFIG = {
             'enableRateLimit': True
         }
     },
-    'coin_count': 10,  # Top 10 coins by volume
-    'quote_currencies': ['USDT', 'USDC', 'KCS', 'BTC', 'ETH', 'BNB'],  # Include for all exchanges
+    'coin_count': 10,
+    'quote_currencies': ['USDT', 'USDC', 'KCS', 'BTC', 'ETH', 'BNB'],
     'avg_trades': 5,
-    'fee_rate': {},  # Populated dynamically per exchange and pair
+    'fee_rate': {},
     'default_fee_rate': {
         'bybit': {'maker': 0.0002, 'taker': 0.001},
         'kucoin': {'maker': 0.001, 'taker': 0.001},
         'binance': {'maker': 0.001, 'taker': 0.001}
     },
-    'use_kcs_discount': False,  # Set to True if paying fees with KCS
-    'use_bnb_discount': False,  # Set to True if paying fees with BNB
-    'min_profit_threshold': 0.005,  # 0.5%
-    'max_profit_cap': 0.1,  # Cap profits at 10% to filter outliers
+    'use_kcs_discount': False,
+    'use_bnb_discount': False,
+    'min_profit_threshold': 0.005,
+    'max_profit_cap': 0.1,
     'max_exposure': 0.1,
     'max_volatility': 0.02,
     'stop_loss_threshold': 0.8,
@@ -113,7 +113,7 @@ CONFIG = {
     'initial_balance': 10000.0,
     'slippage_tolerance': 0.005,
     'trade_log_file': 'trades.csv',
-    'order_book_type': 'market',  # Options: 'market' or 'limit'
+    'order_book_type': 'market',
     'stake_amount': 1000.0
 }
 
@@ -128,7 +128,7 @@ for name in EXCHANGES:
                 if not API_KEYS[name]['passphrase']:
                     logger.warning(f"KuCoin passphrase missing in .env. Prompting for manual input.")
                     API_KEYS[name]['passphrase'] = input(f"Enter {name} Passphrase: ")
-                    CONFIG['exchanges']['kucoin']['passphrase'] = API_KEYS[name]['passphrase']
+                    CONFIG['exchanges']['kucoin']['password'] = API_KEYS[name]['passphrase']
                 exchanges[name] = ccxt.kucoin(CONFIG['exchanges'][name])
             elif name == 'binance':
                 exchanges[name] = ccxt.binance(CONFIG['exchanges'][name])
@@ -142,7 +142,7 @@ for name in EXCHANGES:
         API_KEYS[name]['secret'] = input(f"Enter {name} Secret Key: ")
         if name == 'kucoin':
             API_KEYS[name]['passphrase'] = input(f"Enter {name} Passphrase: ")
-            CONFIG['exchanges']['kucoin']['passphrase'] = API_KEYS[name]['passphrase']
+            CONFIG['exchanges']['kucoin']['password'] = API_KEYS[name]['passphrase']
         if API_KEYS[name]['apiKey'] and API_KEYS[name]['secret']:
             try:
                 if name == 'bybit':
@@ -396,7 +396,7 @@ async def generate_triplets(coins, exchange):
                 base1_r, quote1_r = pair1_r.split('/')
                 base2_r, quote2_r = pair2_r.split('/')
                 base3_r, quote3_r = pair3_r.split('/')
-                if quote1_r == quote2_r and base3_r == base1_r and base2_r == inter:
+                if quote1_r == quote2_r and base3_r == base1_r and quote3_r == base2_r:
                     triplets.append(('reverse', pair1_r, pair2_r, pair3_r))
         logger.info(f"Generated {len(triplets)} triplets on {exchange.id}")
         return triplets, valid_pairs
@@ -479,31 +479,43 @@ async def calculate_triangular_arbitrage(exchange, triplet_type, pair1, pair2, p
                     logger.error(f"Invalid forward triplet for {pair1}, {pair2}, {pair3}")
                     return None, 0.0
                 final_amount = amount2_after_fee * bid3  # Sell base2 for quote1
+                final_currency = quote1
             else:
                 # Reverse: base1/quote1, base2/quote1, base1/base2
                 if quote2 != quote1:
                     reasons.append(f"Invalid reverse triplet: quote2 ({quote2}) != quote1 ({quote1})")
                     logger.error(f"Invalid reverse triplet for {pair1}, {pair2}, {pair3}")
                     return None, 0.0
-                amount2 = amount1_after_fee / (1 / bid2)  # Sell base1 for base2 (bid2 is base2/quote1, invert to quote1/base2)
+                amount2 = amount1_after_fee * (1 / bid2)  # Sell base1 for base2 (bid2 is base2/quote1, invert to quote1/base2)
                 amount2_after_fee = amount2 * (1 - fee2)
                 if base3 != base1 or quote3 != base2:
                     reasons.append(f"Invalid reverse triplet: base3 ({base3}) != base1 ({base1}) or quote3 ({quote3}) != base2 ({base2})")
                     logger.error(f"Invalid reverse triplet for {pair1}, {pair2}, {pair3}")
                     return None, 0.0
-                final_amount = amount2_after_fee * bid3  # Sell base1 for base2
-            final_amount_after_fee = final_amount * (1 - fee3)
-            # Convert back to USDT if final_amount is not in USDT
-            if quote3 != 'USDT':
+                # For reverse, pair3 is base1/base2 (e.g., XRP/BTC), sell base2 for USDT
+                usdt_pair = f"{base2}/USDT"
                 try:
-                    usdt_pair = f"{quote3}/USDT"
+                    usdt_ticker = await exchange.fetch_ticker(usdt_pair)
+                    bid_usdt = usdt_ticker['bid']
+                    final_amount = amount2_after_fee * bid_usdt  # Sell base2 for USDT
+                    final_currency = 'USDT'
+                    logger.info(f"Step 3: Sell {base2} for USDT using {usdt_pair} bid={bid_usdt:.6f}")
+                except Exception as e:
+                    reasons.append(f"Cannot fetch {usdt_pair} for final conversion: {e}")
+                    logger.error(f"Error fetching {usdt_pair} for {pair1}, {pair2}, {pair3}: {e}")
+                    return None, 0.0
+            final_amount_after_fee = final_amount * (1 - fee3)
+            # Convert to USDT if final_currency is not USDT
+            if final_currency != 'USDT':
+                try:
+                    usdt_pair = f"{final_currency}/USDT"
                     usdt_ticker = await exchange.fetch_ticker(usdt_pair)
                     bid_usdt = usdt_ticker['bid']
                     final_amount_after_fee *= bid_usdt
-                    logger.info(f"Converted final amount from {quote3} to USDT using {usdt_pair} bid={bid_usdt:.6f}")
+                    logger.info(f"Converted final amount from {final_currency} to USDT using {usdt_pair} bid={bid_usdt:.6f}")
                 except Exception as e:
-                    reasons.append(f"Cannot convert {quote3} to USDT: {e}")
-                    logger.error(f"Error converting {quote3} to USDT for {pair1}, {pair2}, {pair3}: {e}")
+                    reasons.append(f"Cannot convert {final_currency} to USDT: {e}")
+                    logger.error(f"Error converting {final_currency} to USDT for {pair1}, {pair2}, {pair3}: {e}")
                     return None, 0.0
             profit = final_amount_after_fee - adjusted_amount
             profit_percentage = (profit / adjusted_amount) * 100
@@ -515,7 +527,7 @@ async def calculate_triangular_arbitrage(exchange, triplet_type, pair1, pair2, p
                 f"Calculation for {pair1}, {pair2}, {pair3} ({triplet_type}): "
                 f"Step 1: {adjusted_amount:.2f} {quote1} -> {amount1:.6f} {base1} @ ask {ask1:.6f}, after fee {amount1_after_fee:.6f}; "
                 f"Step 2: {amount1_after_fee:.6f} {base1} -> {amount2:.6f} {base2} @ {'ask' if triplet_type == 'forward' else 'bid (inverted)'} {ask2 if triplet_type == 'forward' else (1/bid2):.6f}, after fee {amount2_after_fee:.6f}; "
-                f"Step 3: {amount2_after_fee:.6f} {base2} -> {final_amount:.6f} {quote3} @ bid {bid3:.6f}, after fee {final_amount_after_fee:.6f} USDT"
+                f"Step 3: {amount2_after_fee:.6f} {base2} -> {final_amount:.6f} {final_currency} @ bid {bid3 if triplet_type == 'forward' else bid_usdt:.6f}, after fee {final_amount_after_fee:.6f} USDT"
             )
             prices.append({
                 'initial_amount': adjusted_amount,
