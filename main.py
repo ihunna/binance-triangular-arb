@@ -54,11 +54,6 @@ if not os.path.exists(env_path):
 
 load_dotenv(env_path)
 
-# Validate .env content
-with open(env_path, 'r') as f:
-    env_content = f.read().strip()
-    logger.info(f".env content (sanitized): {'Non-empty' if env_content else 'Empty'}")
-
 # Load API keys
 EXCHANGES = ['bybit', 'kucoin', 'binance']
 API_KEYS = {}
@@ -71,10 +66,7 @@ for exchange in EXCHANGES:
     logger.info(f"{exchange.upper()}_API_KEY loaded: {'True' if API_KEYS[exchange]['apiKey'] else 'False'}")
     logger.info(f"{exchange.upper()}_SECRET loaded: {'True' if API_KEYS[exchange]['secret'] else 'False'}")
     if exchange == 'kucoin':
-        passphrase = API_KEYS[exchange]['passphrase']
-        logger.info(f"{exchange.upper()}_PASSPHRASE loaded: {'True' if passphrase else 'False'}")
-        if passphrase:
-            logger.info(f"KuCoin passphrase characteristics: length={len(passphrase)}")
+        logger.info(f"{exchange.upper()}_PASSPHRASE loaded: {'True' if API_KEYS[exchange]['passphrase'] else 'False'}")
 
 # Configuration
 CONFIG = {
@@ -90,7 +82,9 @@ CONFIG = {
             'apiKey': API_KEYS['kucoin']['apiKey'],
             'secret': API_KEYS['kucoin']['secret'],
             'passphrase': API_KEYS['kucoin']['passphrase'],
-            'enableRateLimit': True
+            'enableRateLimit': True,
+            'retries': 3,
+            'retryDelay': 2000  # Increased for KuCoin rate limits
         },
         'binance': {
             'active': False,
@@ -99,19 +93,10 @@ CONFIG = {
             'enableRateLimit': True
         }
     },
-    'coin_count': 10,
-    'quote_currencies': ['USDT', 'USDC', 'KCS', 'BTC', 'ETH', 'BNB'],
+    'coin_count': 20,
     'avg_trades': 5,
-    'fee_rate': {},
-    'default_fee_rate': {
-        'bybit': {'maker': 0.0002, 'taker': 0.001},
-        'kucoin': {'maker': 0.001, 'taker': 0.001},
-        'binance': {'maker': 0.001, 'taker': 0.001}
-    },
-    'use_kcs_discount': False,
-    'use_bnb_discount': False,
-    'min_profit_threshold': 0.005,
-    'max_profit_cap': 0.1,
+    'fee_rate': {'bybit': 0.001, 'kucoin': 0.001, 'binance': 0.001},
+    'min_profit_threshold': 0.01,
     'max_exposure': 0.1,
     'max_volatility': 0.02,
     'stop_loss_threshold': 0.8,
@@ -119,61 +104,45 @@ CONFIG = {
     'initial_balance': 10000.0,
     'slippage_tolerance': 0.005,
     'trade_log_file': 'trades.csv',
-    'order_book_type': 'market',
-    'stake_amount': 1000.0
+    'order_book_type': 'market',  # Options: 'market' or 'limit'
+    'stake_amount': 1000.0  # Base trade amount in USDT
 }
 
 # Initialize exchanges
-async def initialize_exchange(name, config):
-    exchange = None
-    try:
-        if name == 'bybit':
-            exchange = ccxt.bybit(config)
-        elif name == 'kucoin':
-            if not config.get('passphrase'):
-                logger.warning(f"KuCoin passphrase missing in .env. Prompting for manual input.")
-                config['passphrase'] = input(f"Enter {name} Passphrase: ").strip()
-                API_KEYS[name]['passphrase'] = config['passphrase']
-                logger.info(f"KuCoin passphrase set: length={len(config['passphrase'])}")
-            exchange = ccxt.kucoin(config)
-            await exchange.load_markets()
-            logger.info(f"KuCoin authentication successful")
-        elif name == 'binance':
-            exchange = ccxt.binance(config)
-        logger.info(f"Initialized {name} exchange")
-        return exchange
-    except ccxt.AuthenticationError as e:
-        logger.error(f"Authentication failed for {name}: {e}\n{traceback.format_exc()}")
-        if exchange:
-            await exchange.close()
-        return None
-    except Exception as e:
-        logger.error(f"Failed to initialize {name}: {e}\n{traceback.format_exc()}")
-        if exchange:
-            await exchange.close()
-        return None
-
 exchanges = {}
 for name in EXCHANGES:
-    if CONFIG['exchanges'][name]['active'] and API_KEYS[name]['apiKey'] and API_KEYS[name]['secret']:
-        exchange = asyncio.run(initialize_exchange(name, CONFIG['exchanges'][name]))
-        if exchange:
-            exchanges[name] = exchange
+    if CONFIG['exchanges'][name]['active'] and API_KEYS[name] and API_KEYS[name]['apiKey'] and API_KEYS[name]['secret']:
+        try:
+            if name == 'bybit':
+                exchanges[name] = ccxt.bybit(CONFIG['exchanges'][name])
+            elif name == 'kucoin':
+                exchanges[name] = ccxt.kucoin(CONFIG['exchanges'][name])
+            elif name == 'binance':
+                exchanges[name] = ccxt.binance(CONFIG['exchanges'][name])
+            logger.info(f"Initialized {name} exchange")
+        except Exception as e:
+            logger.error(f"Failed to initialize {name}: {e}\n{traceback.format_exc()}")
+            exchanges[name] = None
     elif CONFIG['exchanges'][name]['active']:
         logger.warning(f"{name} is active but missing API keys. Prompting for manual input.")
-        API_KEYS[name]['apiKey'] = input(f"Enter {name} API Key: ").strip()
-        API_KEYS[name]['secret'] = input(f"Enter {name} Secret Key: ").strip()
+        API_KEYS[name]['apiKey'] = input(f"Enter {name} API Key: ")
+        API_KEYS[name]['secret'] = input(f"Enter {name} Secret Key: ")
         if name == 'kucoin':
-            API_KEYS[name]['passphrase'] = input(f"Enter {name} Passphrase: ").strip()
-            CONFIG['exchanges']['kucoin']['password'] = API_KEYS[name]['passphrase']
-            logger.info(f"KuCoin passphrase set: length={len(API_KEYS[name]['passphrase'])}")
+            API_KEYS[name]['passphrase'] = input(f"Enter {name} Passphrase: ")
         if API_KEYS[name]['apiKey'] and API_KEYS[name]['secret']:
-            exchange = asyncio.run(initialize_exchange(name, CONFIG['exchanges'][name]))
-            if exchange:
-                exchanges[name] = exchange
+            try:
+                if name == 'bybit':
+                    exchanges[name] = ccxt.bybit(CONFIG['exchanges'][name])
+                elif name == 'kucoin':
+                    exchanges[name] = ccxt.kucoin(CONFIG['exchanges'][name])
+                elif name == 'binance':
+                    exchanges[name] = ccxt.binance(CONFIG['exchanges'][name])
+                logger.info(f"Initialized {name} exchange")
+            except Exception as e:
+                logger.error(f"Failed to initialize {name}: {e}\n{traceback.format_exc()}")
+                exchanges[name] = None
         else:
             logger.warning(f"Skipping {name} due to missing API keys.")
-
 exchanges = {k: v for k, v in exchanges.items() if v is not None}
 
 if not exchanges:
@@ -248,60 +217,18 @@ async def print_summary():
     table.add_row("Recent Profits", f"{[f'{p:.2f}%' for p in recent_profits]}")
     console.print(table)
 
-async def fetch_trading_fees(exchange, valid_pairs):
-    try:
-        fee_dict = {}
-        fee_type = 'maker' if CONFIG['order_book_type'] == 'limit' else 'taker'
-        default_fee = CONFIG['default_fee_rate'][exchange.id][fee_type]
-        
-        if exchange.id == 'kucoin':
-            liquid_pair = 'BTC/USDT'
-            if liquid_pair in valid_pairs:
-                try:
-                    fee_data = await exchange.fetch_trading_fee(liquid_pair)
-                    fee_rate = fee_data[fee_type]
-                    if CONFIG['use_kcs_discount']:
-                        fee_rate *= 0.8
-                    fee_dict = {pair: fee_rate for pair in valid_pairs}
-                    logger.info(f"Fetched fee for {liquid_pair}: {fee_type}={fee_rate:.4f}, applying to {len(valid_pairs)} pairs on {exchange.id}")
-                except Exception as e:
-                    logger.warning(f"Error fetching fee for {liquid_pair} on {exchange.id}: {e}. Using default fee {default_fee:.4f} for {len(valid_pairs)} pairs")
-                    fee_dict = {pair: default_fee for pair in valid_pairs}
-            else:
-                logger.warning(f"Liquid pair {liquid_pair} not in valid pairs. Using default fee {default_fee:.4f} for {len(valid_pairs)} pairs")
-                fee_dict = {pair: default_fee for pair in valid_pairs}
-        else:
-            fees = await exchange.fetch_trading_fees()
-            for pair in valid_pairs:
-                if pair in fees:
-                    fee_rate = fees[pair][fee_type]
-                    if exchange.id == 'binance' and CONFIG['use_bnb_discount']:
-                        fee_rate *= 0.75
-                    fee_dict[pair] = fee_rate
-                    logger.debug(f"Fetched fee for {pair}: {fee_type}={fee_rate:.4f}")
-                else:
-                    logger.warning(f"Fee not found for {pair} on {exchange.id}. Using default fee {default_fee:.4f}")
-                    fee_dict[pair] = default_fee
-            logger.info(f"Fetched trading fees for {len(fee_dict)} pairs on {exchange.id}")
-        
-        return fee_dict
-    except Exception as e:
-        logger.error(f"Error fetching trading fees for {exchange.id}: {e}\n{traceback.format_exc()}")
-        fee_dict = {pair: CONFIG['default_fee_rate'][exchange.id][fee_type] for pair in valid_pairs}
-        logger.info(f"Using default {fee_type} fees for {len(fee_dict)} pairs on {exchange.id}")
-        return fee_dict
-
 async def fetch_market_data(exchange, symbol):
     try:
-        base, quote = symbol.split('/')
+        quote_currency = symbol.split('/')[1]
         if CONFIG['order_book_type'] == 'market':
             ticker = await exchange.fetch_ticker(symbol)
             bid = ticker['bid'] if 'bid' in ticker else None
             ask = ticker['ask'] if 'ask' in ticker else None
             quote_volume = ticker.get('quoteVolume', 0)
+            # Convert quote volume to USDT
             usdt_volume = quote_volume
-            if quote != 'USDT':
-                usdt_pair = f"{quote}/USDT"
+            if quote_currency != 'USDT':
+                usdt_pair = f"{quote_currency}/USDT"
                 try:
                     usdt_ticker = await exchange.fetch_ticker(usdt_pair)
                     bid_price = usdt_ticker['bid'] if 'bid' in usdt_ticker else None
@@ -313,17 +240,18 @@ async def fetch_market_data(exchange, symbol):
                 except Exception as e:
                     logger.warning(f"Error fetching {usdt_pair} for volume conversion: {e}. Assuming zero USDT volume.")
                     usdt_volume = 0
-            return bid, ask, quote_volume, quote, usdt_volume, None, None
-        else:
+            return bid, ask, quote_volume, quote_currency, usdt_volume, None, None
+        else:  # limit order book
             order_book = await exchange.fetch_order_book(symbol, limit=1)
             bid = order_book['bids'][0][0] if order_book['bids'] else None
             ask = order_book['asks'][0][0] if order_book['asks'] else None
             bid_volume = order_book['bids'][0][1] if order_book['bids'] else 0
             ask_volume = order_book['asks'][0][1] if order_book['asks'] else 0
+            # Convert volumes to USDT
             usdt_bid_volume = bid_volume
             usdt_ask_volume = ask_volume
-            if quote != 'USDT':
-                usdt_pair = f"{quote}/USDT"
+            if quote_currency != 'USDT':
+                usdt_pair = f"{quote_currency}/USDT"
                 try:
                     usdt_ticker = await exchange.fetch_ticker(usdt_pair)
                     bid_price = usdt_ticker['bid'] if 'bid' in usdt_ticker else None
@@ -338,7 +266,7 @@ async def fetch_market_data(exchange, symbol):
                     logger.warning(f"Error fetching {usdt_pair} for volume conversion: {e}. Assuming zero USDT volume.")
                     usdt_bid_volume = 0
                     usdt_ask_volume = 0
-            return bid, ask, None, quote, usdt_ask_volume, bid_volume, ask_volume
+            return bid, ask, None, quote_currency, usdt_ask_volume, bid_volume, ask_volume
     except ccxt.RateLimitExceeded as e:
         logger.warning(f"Rate limit exceeded on {exchange.id}. Backing off...")
         logger.error(f"Rate limit error details: {e}\n{traceback.format_exc()}")
@@ -363,194 +291,114 @@ async def fetch_top_coins(exchange, coin_count):
     try:
         markets = await exchange.load_markets()
         tickers = await exchange.fetch_tickers()
-        quote_currencies = [q for q in CONFIG['quote_currencies'] if any(f"/{q}" in symbol for symbol in markets)]
-        valid_pairs = []
-        for symbol in tickers:
-            if markets[symbol].get('active', True):
-                base, quote = symbol.split('/')
-                if quote in quote_currencies:
-                    valid_pairs.append((symbol, tickers[symbol].get('quoteVolume', 0)))
-        valid_pairs.sort(key=lambda x: x[1], reverse=True)
-        base_coins = []
-        for symbol, _ in valid_pairs:
-            base = symbol.split('/')[0]
-            if base not in base_coins and base not in quote_currencies:
-                base_coins.append(base)
-                if len(base_coins) >= coin_count:
-                    break
-        coins = list(set(base_coins + quote_currencies))
+        # Filter coins with USDT pairs and sort by volume
+        usdt_pairs = [symbol for symbol in tickers if symbol.endswith('/USDT') and markets[symbol].get('active', True)]
+        sorted_pairs = sorted(
+            usdt_pairs,
+            key=lambda x: tickers[x].get('quoteVolume', 0),
+            reverse=True
+        )
+        # Extract base coins (e.g., 'BTC' from 'BTC/USDT')
+        coins = [pair.split('/')[0] for pair in sorted_pairs[:coin_count]]
+        # Ensure USDT is included for arbitrage
+        if 'USDT' not in coins:
+            coins.append('USDT')
+        logger.info(f"Fetched {len(coins)} coins on {exchange.id}: {coins}")
+        # Update mock_balance with new coins
         for coin in coins:
             if coin not in mock_balance:
                 mock_balance[coin] = 0.0
-        logger.info(f"Fetched {len(coins)} coins on {exchange.id}: {coins}")
         return coins
     except Exception as e:
         logger.error(f"Error fetching top coins on {exchange.id}: {e}\n{traceback.format_exc()}")
-        return CONFIG['quote_currencies']
+        return ['USDT']  # Fallback to USDT only
 
 async def generate_triplets(coins, exchange):
     try:
         markets = await exchange.load_markets()
-        valid_pairs = set(markets.keys())
-        logger.info(f"Valid pairs on {exchange.id}: {sorted(valid_pairs)}")
+        valid_pairs = set(symbol for symbol in markets if markets[symbol].get('active', True))
+        logger.info(f"Valid pairs on {exchange.id}: {list(valid_pairs)}")
         triplets = []
-        for base, inter, quote in itertools.permutations(coins, 3):
-            # Forward path: e.g., SOL/USDT, BTC/SOL, BTC/USDT
+        for base, quote, third in itertools.permutations(coins, 3):
             pair1 = f"{base}/{quote}"
-            pair2 = f"{inter}/{base}"
-            pair3 = f"{inter}/{quote}"
+            pair2 = f"{third}/{base}"
+            pair3 = f"{third}/{quote}"
             if pair1 in valid_pairs and pair2 in valid_pairs and pair3 in valid_pairs:
-                base1, quote1 = pair1.split('/')
-                base2, quote2 = pair2.split('/')
-                base3, quote3 = pair3.split('/')
-                if quote1 == quote3 and base2 == base1 and base3 == inter:
-                    triplets.append(('forward', pair1, pair2, pair3))
-            # Reverse path: e.g., SOL/USDT, BTC/USDT, SOL/BTC
-            pair1_r = f"{base}/{quote}"
-            pair2_r = f"{inter}/{quote}"
-            pair3_r = f"{base}/{inter}"
-            if pair1_r in valid_pairs and pair2_r in valid_pairs and pair3_r in valid_pairs:
-                base1_r, quote1_r = pair1_r.split('/')
-                base2_r, quote2_r = pair2_r.split('/')
-                base3_r, quote3_r = pair3_r.split('/')
-                if quote1_r == quote2_r and base3_r == base1_r and quote3_r == base2_r:
-                    triplets.append(('reverse', pair1_r, pair2_r, pair3_r))
-        logger.info(f"Generated {len(triplets)} triplets on {exchange.id}")
-        return triplets, valid_pairs
+                triplets.append((pair1, pair2, pair3))
+        logger.info(f"Generated {len(triplets)} triplets on {exchange.id}: {triplets}")
+        return triplets
     except Exception as e:
         logger.error(f"Error generating triplets on {exchange.id}: {e}\n{traceback.format_exc()}")
-        return [], set()
+        return []
 
-async def calculate_triangular_arbitrage(exchange, triplet_type, pair1, pair2, pair3, amount, avg_trades):
+async def calculate_triangular_arbitrage(exchange, pair1, pair2, pair3, amount, avg_trades):
     try:
         prices = []
-        reasons = []
-        fees = CONFIG['fee_rate'].get(exchange.id, {})
-        fee_type = 'maker' if CONFIG['order_book_type'] == 'limit' else 'taker'
-        default_fee = CONFIG['default_fee_rate'][exchange.id][fee_type]
-        fee1 = fees.get(pair1, default_fee)
-        fee2 = fees.get(pair2, default_fee)
-        fee3 = fees.get(pair3, default_fee)
         for _ in range(avg_trades):
             bid1, ask1, vol1, quote_curr1, usdt_vol1, bid_vol1, ask_vol1 = await fetch_market_data(exchange, pair1)
             bid2, ask2, vol2, quote_curr2, usdt_vol2, bid_vol2, ask_vol2 = await fetch_market_data(exchange, pair2)
             bid3, ask3, vol3, quote_curr3, usdt_vol3, bid_vol3, ask_vol3 = await fetch_market_data(exchange, pair3)
+            
             if not all([bid1, ask1, bid2, ask2, bid3, ask3]):
-                reasons.append(f"Missing price data: {pair1} (bid={bid1}, ask={ask1}), "
-                              f"{pair2} (bid={bid2}, ask={ask2}), {pair3} (bid={bid3}, ask={ask3})")
-                logger.error(f"Missing price data for {pair1}, {pair2}, {pair3} on {exchange.id}: {reasons[-1]}")
+                logger.warning(f"Skipping triplet {pair1}, {pair2}, {pair3} due to missing price data")
                 return None, 0.0
+
+            # Adjust stake amount for limit order book based on pair1's ask volume
             adjusted_amount = amount
             if CONFIG['order_book_type'] == 'limit' and ask_vol1 is not None:
+                # For pair1, we buy the base currency (e.g., BTC in BTC/USDT) using USDT
                 usdt_ask_vol1 = ask_vol1 * ask1 if quote_curr1 == 'USDT' else ask_vol1 * (await exchange.fetch_ticker(f"{quote_curr1}/USDT"))['bid']
                 if usdt_ask_vol1 < amount:
                     adjusted_amount = usdt_ask_vol1
                     logger.info(f"Adjusted stake amount from {amount:.2f} to {adjusted_amount:.2f} USDT due to low ask volume on {pair1}")
-            min_usdt_volume = min(usdt_vol1, usdt_vol2, usdt_vol3)
-            if min_usdt_volume < 1000:
-                volume_log = (
-                    f"{pair1} ({'24h' if CONFIG['order_book_type'] == 'market' else 'ask'}: "
-                    f"{vol1 if vol1 is not None else ask_vol1:.2f} {quote_curr1}, {usdt_vol1:.2f} USDT @ bid {bid1:.6f}, ask {ask1:.6f}), "
-                    f"{pair2} ({'24h' if CONFIG['order_book_type'] == 'market' else 'ask'}: "
-                    f"{vol2 if vol2 is not None else ask_vol2:.2f} {quote_curr2}, {usdt_vol2:.2f} USDT @ bid {bid2:.6f}, ask {ask2:.6f}), "
-                    f"{pair3} ({'24h' if CONFIG['order_book_type'] == 'market' else 'ask'}: "
-                    f"{vol3 if vol3 is not None else ask_vol3:.2f} {quote_curr3}, {usdt_vol3:.2f} USDT @ bid {bid3:.6f}, ask {ask3:.6f})"
-                )
-                reasons.append(f"Low {'24h' if CONFIG['order_book_type'] == 'market' else 'order book'} volume: {min_usdt_volume:.2f} USDT < 1000")
-                logger.warning(f"Low volume for {pair1}, {pair2}, {pair3} on {exchange.id}. Trade amount: {adjusted_amount:.2f}, Volumes: {volume_log}")
-                return None, 0.0
+
+            # Warn about low 24h volume in USDT (for market mode)
+            if CONFIG['order_book_type'] == 'market':
+                min_usdt_volume = min(usdt_vol1, usdt_vol2, usdt_vol3)
+                if min_usdt_volume < 1000:
+                    logger.warning(f"Low 24h volume for {pair1}, {pair2}, {pair3} on {exchange.id}. "
+                                  f"Trade amount: {adjusted_amount:.2f}, "
+                                  f"Volumes: {pair1} (24h: {vol1:.2f} {quote_curr1}, {usdt_vol1:.2f} USDT @ bid {bid1:.6f}, ask {ask1:.6f}), "
+                                  f"{pair2} (24h: {vol2:.2f} {quote_curr2}, {usdt_vol2:.2f} USDT @ bid {bid2:.6f}, ask {ask2:.6f}), "
+                                  f"{pair3} (24h: {vol3:.2f} {quote_curr3}, {usdt_vol3:.2f} USDT @ bid {bid3:.6f}, ask {ask3:.6f})")
+
             volatility = max(
                 await calculate_volatility(exchange, pair1),
                 await calculate_volatility(exchange, pair2),
                 await calculate_volatility(exchange, pair3)
             )
             if volatility > CONFIG['max_volatility']:
-                reasons.append(f"Volatility too high: {volatility:.4f} > {CONFIG['max_volatility']}")
                 logger.info(f"Volatility too high ({volatility:.4f}) for {pair1}, {pair2}, {pair3}")
                 return None, 0.0
+
             slippage = max(
                 abs((ask1 - bid1) / bid1),
                 abs((ask2 - bid2) / bid2),
                 abs((ask3 - bid3) / bid3)
             )
             if slippage > CONFIG['slippage_tolerance']:
-                reasons.append(f"Slippage too high: {slippage:.4f} > {CONFIG['slippage_tolerance']}")
                 logger.info(f"Slippage too high ({slippage:.4f}) for {pair1}, {pair2}, {pair3}")
                 return None, 0.0
-            # Calculate arbitrage
-            base1, quote1 = pair1.split('/')
-            base2, quote2 = pair2.split('/')
-            base3, quote3 = pair3.split('/')
-            amount1 = adjusted_amount / ask1  # Buy base1 with quote1
-            amount1_after_fee = amount1 * (1 - fee1)
-            if triplet_type == 'forward':
-                # Forward: base1/quote1, base2/base1, base2/quote1
-                if quote2 != base1:
-                    reasons.append(f"Invalid forward triplet: quote2 ({quote2}) != base1 ({base1})")
-                    logger.error(f"Invalid forward triplet for {pair1}, {pair2}, {pair3}")
-                    return None, 0.0
-                amount2 = amount1_after_fee / ask2  # Buy base2 with base1
-                amount2_after_fee = amount2 * (1 - fee2)
-                if base3 != base2 or quote3 != quote1:
-                    reasons.append(f"Invalid forward triplet: base3 ({base3}) != base2 ({base2}) or quote3 ({quote3}) != quote1 ({quote1})")
-                    logger.error(f"Invalid forward triplet for {pair1}, {pair2}, {pair3}")
-                    return None, 0.0
-                final_amount = amount2_after_fee * bid3  # Sell base2 for quote1
-                final_currency = quote1
-            else:
-                # Reverse: base1/quote1, base2/quote1, base1/base2
-                if quote2 != quote1:
-                    reasons.append(f"Invalid reverse triplet: quote2 ({quote2}) != quote1 ({quote1})")
-                    logger.error(f"Invalid reverse triplet for {pair1}, {pair2}, {pair3}")
-                    return None, 0.0
-                amount2 = amount1_after_fee * (1 / bid2)  # Sell base1 for base2 (bid2 is base2/quote1, invert to quote1/base2)
-                amount2_after_fee = amount2 * (1 - fee2)
-                if base3 != base1 or quote3 != base2:
-                    reasons.append(f"Invalid reverse triplet: base3 ({base3}) != base1 ({base1}) or quote3 ({quote3}) != base2 ({base2})")
-                    logger.error(f"Invalid reverse triplet for {pair1}, {pair2}, {pair3}")
-                    return None, 0.0
-                usdt_pair = f"{base2}/USDT"
-                try:
-                    usdt_ticker = await exchange.fetch_ticker(usdt_pair)
-                    bid_usdt = usdt_ticker['bid']
-                    final_amount = amount2_after_fee * bid_usdt  # Sell base2 for USDT
-                    final_currency = 'USDT'
-                    logger.info(f"Step 3: Sell {base2} for USDT using {usdt_pair} bid={bid_usdt:.6f}")
-                except Exception as e:
-                    reasons.append(f"Cannot fetch {usdt_pair} for final conversion: {e}")
-                    logger.error(f"Error fetching {usdt_pair} for {pair1}, {pair2}, {pair3}: {e}")
-                    return None, 0.0
-            final_amount_after_fee = final_amount * (1 - fee3)
-            if final_currency != 'USDT':
-                try:
-                    usdt_pair = f"{final_currency}/USDT"
-                    usdt_ticker = await exchange.fetch_ticker(usdt_pair)
-                    bid_usdt = usdt_ticker['bid']
-                    final_amount_after_fee *= bid_usdt
-                    logger.info(f"Converted final amount from {final_currency} to USDT using {usdt_pair} bid={bid_usdt:.6f}")
-                except Exception as e:
-                    reasons.append(f"Cannot convert {final_currency} to USDT: {e}")
-                    logger.error(f"Error converting {final_currency} to USDT for {pair1}, {pair2}, {pair3}: {e}")
-                    return None, 0.0
+
+            amount1 = adjusted_amount / ask1
+            amount1_after_fee = amount1 * (1 - CONFIG['fee_rate'][exchange.id])
+            amount2 = amount1_after_fee / ask2
+            amount2_after_fee = amount2 * (1 - CONFIG['fee_rate'][exchange.id])
+            final_amount = amount2_after_fee * bid3
+            final_amount_after_fee = final_amount * (1 - CONFIG['fee_rate'][exchange.id])
+
             profit = final_amount_after_fee - adjusted_amount
             profit_percentage = (profit / adjusted_amount) * 100
-            if profit_percentage > CONFIG['max_profit_cap'] * 100:
-                reasons.append(f"Profit too high: {profit_percentage:.2f}% > {CONFIG['max_profit_cap'] * 100:.2f}%")
-                logger.warning(f"Unrealistic profit for {pair1}, {pair2}, {pair3}: {profit_percentage:.2f}%")
-                return None, 0.0
-            logger.info(
-                f"Calculation for {pair1}, {pair2}, {pair3} ({triplet_type}): "
-                f"Step 1: {adjusted_amount:.2f} {quote1} -> {amount1:.6f} {base1} @ ask {ask1:.6f}, after fee {amount1_after_fee:.6f}; "
-                f"Step 2: {amount1_after_fee:.6f} {base1} -> {amount2:.6f} {base2} @ {'ask' if triplet_type == 'forward' else 'bid (inverted)'} {ask2 if triplet_type == 'forward' else (1/bid2):.6f}, after fee {amount2_after_fee:.6f}; "
-                f"Step 3: {amount2_after_fee:.6f} {base2} -> {final_amount:.6f} {final_currency} @ bid {bid3 if triplet_type == 'forward' else bid_usdt:.6f}, after fee {final_amount_after_fee:.6f} USDT"
-            )
+
             prices.append({
                 'initial_amount': adjusted_amount,
                 'final_amount': final_amount_after_fee,
                 'profit': profit,
                 'profit_percentage': profit_percentage
             })
+
             await asyncio.sleep(0.1)
+
         avg_profit = np.mean([p['profit'] for p in prices])
         avg_profit_percentage = np.mean([p['profit_percentage'] for p in prices])
         trade_details = {
@@ -560,42 +408,12 @@ async def calculate_triangular_arbitrage(exchange, triplet_type, pair1, pair2, p
             'avg_profit_percentage': avg_profit_percentage,
             'prices': prices
         }
-        dynamic_threshold = CONFIG['min_profit_threshold']
-        async with history_lock:
-            if recent_profits:
-                valid_profits = [p for p in recent_profits if p <= CONFIG['max_profit_cap'] * 100]
-                if valid_profits:
-                    dynamic_threshold = max(CONFIG['min_profit_threshold'], np.mean(valid_profits) * 0.8)
-                else:
-                    dynamic_threshold = CONFIG['min_profit_threshold']
-                    recent_profits.clear()
-        if avg_profit_percentage < dynamic_threshold * 100:
-            reasons.append(f"Profit too low: {avg_profit_percentage:.2f}% < {dynamic_threshold * 100:.2f}%")
-            logger.info(f"No profitable trade for {pair1}, {pair2}, {pair3}: {', '.join(reasons)}")
-            return None, 0.0
-        volume_log = (
-            f"{pair1} ({'24h' if CONFIG['order_book_type'] == 'market' else 'ask'}: "
-            f"{vol1 if vol1 is not None else ask_vol1:.2f} {quote_curr1}, {usdt_vol1:.2f} USDT @ bid {bid1:.6f}, ask {ask1:.6f}), "
-            f"{pair2} ({'24h' if CONFIG['order_book_type'] == 'market' else 'ask'}: "
-            f"{vol2 if vol2 is not None else ask_vol2:.2f} {quote_curr2}, {usdt_vol2:.2f} USDT @ bid {bid2:.6f}, ask {ask2:.6f}), "
-            f"{pair3} ({'24h' if CONFIG['order_book_type'] == 'market' else 'ask'}: "
-            f"{vol3 if vol3 is not None else ask_vol3:.2f} {quote_curr3}, {usdt_vol3:.2f} USDT @ bid {bid3:.6f}, ask {ask3:.6f})"
-        )
-        logger.info(
-            f"Arbitrage opportunity found for {pair1}, {pair2}, {pair3} on {exchange.id}: "
-            f"Profit {avg_profit_percentage:.2f}% >= {dynamic_threshold * 100:.2f}%, "
-            f"Initial amount {adjusted_amount:.2f} USDT, Final amount {final_amount_after_fee:.2f} USDT, "
-            f"Fees: {pair1}={fee1:.4f}, {pair2}={fee2:.4f}, {pair3}={fee3:.4f}, "
-            f"Volume: {volume_log}, "
-            f"Volatility: {volatility:.4f} <= {CONFIG['max_volatility']}, "
-            f"Slippage: {slippage:.4f} <= {CONFIG['slippage_tolerance']}"
-        )
+        # Log stake amount reset for next triplet
         if CONFIG['order_book_type'] == 'limit' and adjusted_amount != amount:
             logger.info(f"Stake amount reset to {CONFIG['stake_amount']:.2f} USDT for next triplet")
         return trade_details, prices[-1]['final_amount']
     except Exception as e:
-        reasons.append(f"Calculation error: {str(e)}")
-        logger.error(f"Error calculating arbitrage on {exchange.id} for {pair1}, {pair2}, {pair3}: {', '.join(reasons)}\n{traceback.format_exc()}")
+        logger.error(f"Error calculating arbitrage for {pair1}, {pair2}, {pair3} on {exchange.id}: {e}\n{traceback.format_exc()}")
         return None, 0.0
 
 async def simulate_trade(exchange, pair1, pair2, pair3, trade_details):
@@ -606,24 +424,31 @@ async def simulate_trade(exchange, pair1, pair2, pair3, trade_details):
         final_amount = trade_details['final_amount']
         profit = trade_details['avg_profit']
         profit_percentage = trade_details['avg_profit_percentage']
-        async with balance_lock:
-            mock_balance['USDT'] = mock_balance['USDT'] - initial_amount + final_amount
+        dynamic_threshold = CONFIG['min_profit_threshold']
         async with history_lock:
-            if profit_percentage <= CONFIG['max_profit_cap'] * 100:
+            if recent_profits:
+                dynamic_threshold = max(CONFIG['min_profit_threshold'], np.mean(recent_profits) * 0.8)
+        if profit_percentage >= dynamic_threshold:
+            async with balance_lock:
+                mock_balance['USDT'] = mock_balance['USDT'] - initial_amount + final_amount
+            async with history_lock:
                 recent_profits.append(profit_percentage)
-            trade_history.append(trade_details)
-            if len(recent_profits) > 10:
-                recent_profits.pop(0)
-        await log_trade_to_csv(exchange, pair1, pair2, pair3, trade_details)
-        print_trade_update(exchange, pair1, pair2, pair3, trade_details)
-        async with balance_lock:
-            if mock_balance['USDT'] < initial_balance * CONFIG['stop_loss_threshold']:
-                logger.error(f"Stop-loss triggered: Balance below threshold")
-                await print_summary()
-                raise Exception("Stop-loss triggered")
-        return True
+                trade_history.append(trade_details)
+                if len(recent_profits) > 10:
+                    recent_profits.pop(0)
+            print_trade_update(exchange, pair1, pair2, pair3, trade_details)
+            await log_trade_to_csv(exchange, pair1, pair2, pair3, trade_details)
+            async with balance_lock:
+                if mock_balance['USDT'] < initial_balance * CONFIG['stop_loss_threshold']:
+                    logger.error(f"Stop-loss triggered: Balance below threshold")
+                    await print_summary()
+                    raise Exception("Stop-loss triggered")
+            return True
+        else:
+            logger.info(f"No profitable trade for {pair1}, {pair2}, {pair3}. Profit {profit_percentage:.2f}% below threshold {dynamic_threshold:.2f}%")
+            return False
     except Exception as e:
-        logger.error(f"Error simulating trade on {exchange.id}: {e}\n{traceback.format_exc()}")
+        logger.error(f"Error simulating trade for {pair1}, {pair2}, {pair3} on {exchange.id}: {e}\n{traceback.format_exc()}")
         return False
 
 async def run_exchange(exchange_name, exchange):
@@ -634,10 +459,12 @@ async def run_exchange(exchange_name, exchange):
         if len(coins) < 3:
             logger.error(f"Not enough coins ({len(coins)}) to form triplets on {exchange_name}")
             return
-        triplets, valid_pairs = await generate_triplets(coins, exchange)
-        console.print(f"[cyan]Found {len(triplets)} valid triplets on {exchange_name}[/cyan]")
+        triplets = await generate_triplets(coins, exchange)
+        console.print(f"[cyan]Found {len(triplets)} valid triplets on {exchange_name}: {triplets}[/cyan]")
         logger.info(f"Found {len(triplets)} valid triplets on {exchange_name}")
-        CONFIG['fee_rate'][exchange_name] = await fetch_trading_fees(exchange, valid_pairs)
+        if not triplets:
+            logger.error(f"No valid triplets generated on {exchange_name}. Stopping.")
+            return
         while True:
             async with balance_lock:
                 if mock_balance['USDT'] < initial_balance * CONFIG['stop_loss_threshold']:
@@ -645,18 +472,21 @@ async def run_exchange(exchange_name, exchange):
                     logger.error(f"Trading halted on {exchange_name}: Balance below stop-loss threshold")
                     await print_summary()
                     break
-            for triplet_type, pair1, pair2, pair3 in triplets:
-                logger.info(f"Checking arbitrage on {exchange_name} for {pair1}, {pair2}, {pair3} ({triplet_type})")
+            for pair1, pair2, pair3 in triplets:
+                logger.info(f"Processing triplet {pair1}, {pair2}, {pair3} on {exchange_name}")
                 async with balance_lock:
                     max_trade_amount = mock_balance['USDT'] * CONFIG['max_exposure']
                     trade_amount = min(max_trade_amount, CONFIG['stake_amount'])
-                trade_details, final_amount = await calculate_triangular_arbitrage(
-                    exchange, triplet_type, pair1, pair2, pair3, trade_amount, CONFIG['avg_trades']
-                )
-                if trade_details and final_amount > trade_details['initial_amount']:
-                    await simulate_trade(exchange, pair1, pair2, pair3, trade_details)
-                else:
-                    logger.info(f"No arbitrage opportunity on {exchange_name} for {pair1}, {pair2}, {pair3}: No trade details or unprofitable")
+                try:
+                    trade_details, final_amount = await calculate_triangular_arbitrage(
+                        exchange, pair1, pair2, pair3, trade_amount, CONFIG['avg_trades']
+                    )
+                    if trade_details and final_amount > trade_details['initial_amount']:
+                        await simulate_trade(exchange, pair1, pair2, pair3, trade_details)
+                    else:
+                        logger.info(f"No arbitrage opportunity on {exchange_name} for {pair1}, {pair2}, {pair3}")
+                except Exception as e:
+                    logger.error(f"Error processing triplet {pair1}, {pair2}, {pair3} on {exchange_name}: {e}\n{traceback.format_exc()}")
                 await asyncio.sleep(CONFIG['sleep_interval'])
     except Exception as e:
         console.print(f"[bold red]Fatal error on {exchange_name}: {e}[/bold red]")
