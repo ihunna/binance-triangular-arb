@@ -54,6 +54,11 @@ if not os.path.exists(env_path):
 
 load_dotenv(env_path)
 
+# Validate .env content
+with open(env_path, 'r') as f:
+    env_content = f.read().strip()
+    logger.info(f".env content (sanitized): {'Non-empty' if env_content else 'Empty'}")
+
 # Load API keys
 EXCHANGES = ['bybit', 'kucoin', 'binance']
 API_KEYS = {}
@@ -81,7 +86,7 @@ CONFIG = {
             'active': True,
             'apiKey': API_KEYS['kucoin']['apiKey'],
             'secret': API_KEYS['kucoin']['secret'],
-            'password': API_KEYS['kucoin']['passphrase'],  # Use 'password' for ccxt.kucoin
+            'password': API_KEYS['kucoin']['passphrase'],
             'enableRateLimit': True,
             'retries': 3,
             'retryDelay': 1000
@@ -118,45 +123,64 @@ CONFIG = {
 }
 
 # Initialize exchanges
-exchanges = {}
-for name in EXCHANGES:
-    if CONFIG['exchanges'][name]['active'] and API_KEYS[name] and API_KEYS[name]['apiKey'] and API_KEYS[name]['secret']:
+async def initialize_exchange(name, config):
+    max_retries = config.get('retries', 3)
+    retry_delay = config.get('retryDelay', 1000) / 1000  # Convert to seconds
+    for attempt in range(max_retries):
         try:
             if name == 'bybit':
-                exchanges[name] = ccxt.bybit(CONFIG['exchanges'][name])
+                exchange = ccxt.bybit(config)
             elif name == 'kucoin':
-                if not API_KEYS[name]['passphrase']:
+                if not config.get('password'):
                     logger.warning(f"KuCoin passphrase missing in .env. Prompting for manual input.")
-                    API_KEYS[name]['passphrase'] = input(f"Enter {name} Passphrase: ")
-                    CONFIG['exchanges']['kucoin']['password'] = API_KEYS[name]['passphrase']
-                exchanges[name] = ccxt.kucoin(CONFIG['exchanges'][name])
+                    config['password'] = input(f"Enter {name} Passphrase: ").strip()
+                    API_KEYS[name]['passphrase'] = config['password']
+                exchange = ccxt.kucoin(config)
+                # Verify KuCoin authentication
+                await exchange.load_markets()
+                logger.info(f"KuCoin authentication successful")
             elif name == 'binance':
-                exchanges[name] = ccxt.binance(CONFIG['exchanges'][name])
+                exchange = ccxt.binance(config)
             logger.info(f"Initialized {name} exchange")
+            return exchange
+        except ccxt.AuthenticationError as e:
+            logger.error(f"Authentication failed for {name} on attempt {attempt + 1}/{max_retries}: {e}")
+            if name == 'kucoin' and attempt < max_retries - 1:
+                logger.warning(f"Retrying KuCoin authentication with new passphrase")
+                config['password'] = input(f"KuCoin authentication failed. Enter new Passphrase: ").strip()
+                API_KEYS[name]['passphrase'] = config['password']
+                await asyncio.sleep(retry_delay * (2 ** attempt))  # Exponential backoff
+                continue
+            logger.error(f"Failed to initialize {name} after {max_retries} attempts: {e}\n{traceback.format_exc()}")
+            return None
         except Exception as e:
-            logger.error(f"Failed to initialize {name}: {e}\n{traceback.format_exc()}")
-            exchanges[name] = None
+            logger.error(f"Failed to initialize {name} on attempt {attempt + 1}/{max_retries}: {e}\n{traceback.format_exc()}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(retry_delay * (2 ** attempt))
+                continue
+            return None
+    return None
+
+exchanges = {}
+for name in EXCHANGES:
+    if CONFIG['exchanges'][name]['active'] and API_KEYS[name]['apiKey'] and API_KEYS[name]['secret']:
+        exchange = asyncio.run(initialize_exchange(name, CONFIG['exchanges'][name]))
+        if exchange:
+            exchanges[name] = exchange
     elif CONFIG['exchanges'][name]['active']:
         logger.warning(f"{name} is active but missing API keys. Prompting for manual input.")
-        API_KEYS[name]['apiKey'] = input(f"Enter {name} API Key: ")
-        API_KEYS[name]['secret'] = input(f"Enter {name} Secret Key: ")
+        API_KEYS[name]['apiKey'] = input(f"Enter {name} API Key: ").strip()
+        API_KEYS[name]['secret'] = input(f"Enter {name} Secret Key: ").strip()
         if name == 'kucoin':
-            API_KEYS[name]['passphrase'] = input(f"Enter {name} Passphrase: ")
+            API_KEYS[name]['passphrase'] = input(f"Enter {name} Passphrase: ").strip()
             CONFIG['exchanges']['kucoin']['password'] = API_KEYS[name]['passphrase']
         if API_KEYS[name]['apiKey'] and API_KEYS[name]['secret']:
-            try:
-                if name == 'bybit':
-                    exchanges[name] = ccxt.bybit(CONFIG['exchanges'][name])
-                elif name == 'kucoin':
-                    exchanges[name] = ccxt.kucoin(CONFIG['exchanges'][name])
-                elif name == 'binance':
-                    exchanges[name] = ccxt.binance(CONFIG['exchanges'][name])
-                logger.info(f"Initialized {name} exchange")
-            except Exception as e:
-                logger.error(f"Failed to initialize {name}: {e}\n{traceback.format_exc()}")
-                exchanges[name] = None
+            exchange = asyncio.run(initialize_exchange(name, CONFIG['exchanges'][name]))
+            if exchange:
+                exchanges[name] = exchange
         else:
             logger.warning(f"Skipping {name} due to missing API keys.")
+
 exchanges = {k: v for k, v in exchanges.items() if v is not None}
 
 if not exchanges:
@@ -492,7 +516,6 @@ async def calculate_triangular_arbitrage(exchange, triplet_type, pair1, pair2, p
                     reasons.append(f"Invalid reverse triplet: base3 ({base3}) != base1 ({base1}) or quote3 ({quote3}) != base2 ({base2})")
                     logger.error(f"Invalid reverse triplet for {pair1}, {pair2}, {pair3}")
                     return None, 0.0
-                # For reverse, pair3 is base1/base2 (e.g., XRP/BTC), sell base2 for USDT
                 usdt_pair = f"{base2}/USDT"
                 try:
                     usdt_ticker = await exchange.fetch_ticker(usdt_pair)
@@ -505,7 +528,6 @@ async def calculate_triangular_arbitrage(exchange, triplet_type, pair1, pair2, p
                     logger.error(f"Error fetching {usdt_pair} for {pair1}, {pair2}, {pair3}: {e}")
                     return None, 0.0
             final_amount_after_fee = final_amount * (1 - fee3)
-            # Convert to USDT if final_currency is not USDT
             if final_currency != 'USDT':
                 try:
                     usdt_pair = f"{final_currency}/USDT"
@@ -599,8 +621,8 @@ async def simulate_trade(exchange, pair1, pair2, pair3, trade_details):
             trade_history.append(trade_details)
             if len(recent_profits) > 10:
                 recent_profits.pop(0)
-        print_trade_update(exchange, pair1, pair2, pair3, trade_details)
         await log_trade_to_csv(exchange, pair1, pair2, pair3, trade_details)
+        print_trade_update(exchange, pair1, pair2, pair3, trade_details)
         async with balance_lock:
             if mock_balance['USDT'] < initial_balance * CONFIG['stop_loss_threshold']:
                 logger.error(f"Stop-loss triggered: Balance below threshold")
